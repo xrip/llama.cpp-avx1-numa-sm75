@@ -1084,6 +1084,18 @@ static buft_list_t make_cpu_buft_list(const std::vector<llama_device> & devices,
     return buft_list;
 }
 
+static bool llama_tensor_is_cpu_moe(llm_tensor tensor) {
+    switch (tensor) {
+        case LLM_TENSOR_FFN_GATE_EXPS:
+        case LLM_TENSOR_FFN_GATE_UP_EXPS:
+        case LLM_TENSOR_FFN_DOWN_EXPS:
+        case LLM_TENSOR_FFN_UP_EXPS:
+            return true;
+        default:
+            return false;
+    }
+}
+
 // GPU: split if LLAMA_SPLIT_MODE_ROW -> GPU
 static buft_list_t make_gpu_buft_list(ggml_backend_dev_t dev, llama_split_mode split_mode, const float * tensor_split) {
     buft_list_t buft_list;
@@ -1108,26 +1120,44 @@ static buft_list_t make_gpu_buft_list(ggml_backend_dev_t dev, llama_split_mode s
                 buft_list.emplace_back(dev, buft);
             }
         } else {
-            throw std::runtime_error(format("device %s does not support split buffers", ggml_backend_dev_name(dev)));
+            throw std::runtime_error(format(
+                        "--split-mode row is deprecated and is not supported by device %s.\n"
+                        "Use --split-mode tensor where supported, or --split-mode layer otherwise.",
+                        ggml_backend_dev_name(dev)));
         }
     }
 
-    // add the device default buffer type
-    buft_list.emplace_back(dev, ggml_backend_dev_buffer_type(dev));
+    auto add_default_buft = [&]() {
+        buft_list.emplace_back(dev, ggml_backend_dev_buffer_type(dev));
+    };
 
-    // add the device extra buffer type (if any)
-    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
-    if (reg) {
-        auto ggml_backend_dev_get_extra_bufts_fn = (ggml_backend_dev_get_extra_bufts_t)
-            ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_extra_bufts");
+    auto add_extra_bufts = [&]() {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        if (reg) {
+            auto ggml_backend_dev_get_extra_bufts_fn = (ggml_backend_dev_get_extra_bufts_t)
+                ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_extra_bufts");
 
-        if (ggml_backend_dev_get_extra_bufts_fn) {
-            ggml_backend_buffer_type_t * extra_bufts = ggml_backend_dev_get_extra_bufts_fn(dev);
-            while (extra_bufts && *extra_bufts) {
-                buft_list.emplace_back(dev, *extra_bufts);
-                ++extra_bufts;
+            if (ggml_backend_dev_get_extra_bufts_fn) {
+                ggml_backend_buffer_type_t * extra_bufts = ggml_backend_dev_get_extra_bufts_fn(dev);
+                while (extra_bufts && *extra_bufts) {
+                    buft_list.emplace_back(dev, *extra_bufts);
+                    ++extra_bufts;
+                }
             }
         }
+    };
+
+    // for CPU devices (a NUMA node under --numa split) the extra buffer types, i.e. repack, must come first,
+    // as in make_cpu_buft_list, otherwise the plain node buffer type wins and repacking never happens.
+    // the same goes for a Meta device: over CPU devices it exposes their repack buffer types as meta
+    // extra buffer types (GPU-backed meta devices expose none, so the order does not matter there)
+    if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU ||
+        ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_META) {
+        add_extra_bufts();
+        add_default_buft();
+    } else {
+        add_default_buft();
+        add_extra_bufts();
     }
 
     return buft_list;
@@ -1156,6 +1186,7 @@ struct llama_model::impl {
     std::vector<std::pair<ggml_context_ptr, std::vector<ggml_backend_buffer_ptr>>> ctxs_bufs;
 
     buft_list_t cpu_buft_list;
+    std::vector<buft_list_t> cpu_moe_buft_lists;
     std::map<ggml_backend_dev_t, buft_list_t> gpu_buft_list;
 
     struct layer_dev {
@@ -1419,6 +1450,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     // build a list of buffer types for the CPU and GPU devices
     pimpl->cpu_buft_list = make_cpu_buft_list(devices, params.use_extra_bufts, params.no_host);
+    pimpl->cpu_moe_buft_lists.reserve(cpu_moe_devices.size());
+    for (const auto & dev : cpu_moe_devices) {
+        buft_list_t buft_list = make_gpu_buft_list(dev.dev, LLAMA_SPLIT_MODE_LAYER, nullptr);
+        buft_list.insert(buft_list.end(), pimpl->cpu_buft_list.begin(), pimpl->cpu_buft_list.end());
+        pimpl->cpu_moe_buft_lists.emplace_back(std::move(buft_list));
+    }
     for (const auto & dev : devices) {
         buft_list_t buft_list = make_gpu_buft_list(dev.dev, split_mode, tensor_split);
         // add CPU buffer types as a fallback
@@ -1481,6 +1518,13 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     // assign the input layer
     // there is very little benefit to offloading the input layer, so always keep it on the CPU
     pimpl->dev_input = { cpu_dev, &pimpl->cpu_buft_list };
+
+    // ... unless the first device is a NUMA node, which is also host memory. keeping the input layer on the
+    // fallback CPU backend would wake its thread pool once per token for one small op, and its threads then
+    // spin on the cores the node backends compute on, which costs far more than the op itself
+    if (!devices.empty() && act_gpu_layers > 0 && llama_dev_numa_node(devices[0].dev) >= 0) {
+        pimpl->dev_input = { devices[0].dev, &pimpl->gpu_buft_list.at(devices[0].dev) };
+    }
 
     // assign the repeating layers to the devices according to the splits
     pimpl->dev_layer.resize(n_layer_all);
@@ -1710,6 +1754,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 throw std::runtime_error(format("%s: no CPU backend found", __func__));
             }
         }
+        for (size_t i = 0; i < cpu_moe_devices.size(); ++i) {
+            if (dev == cpu_moe_devices[i].dev) {
+                cpu_moe_devices_used[i] = true;
+                break;
+            }
+        }
         ggml_backend_dev_props props;
         ggml_backend_dev_get_props(dev, &props);
         bool buffer_from_host_ptr_supported = props.caps.buffer_from_host_ptr;
@@ -1753,6 +1803,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             }
             if (buf == nullptr) {
                 throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
+            }
+            if (use_mlock && !ggml_backend_buffer_is_host(buf)) {
+                // e.g. a meta buffer of a tensor split, whose shards have no single base address
+                LLAMA_LOG_WARN("%s: --mlock does not cover the %s buffer\n",
+                        __func__, ggml_backend_buffer_name(buf));
             }
             if (use_mlock && ggml_backend_buffer_is_host(buf)) {
                 pimpl->mlock_bufs.emplace_back(new llama_mlock);
@@ -1822,9 +1877,13 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 }
 
 ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
+    const buft_list_t * buft_list_cpu = &pimpl->cpu_buft_list;
+    if (!cpu_moe_devices.empty() && tn.bid >= 0 && llama_tensor_is_cpu_moe(tn.tensor)) {
+        buft_list_cpu = &pimpl->cpu_moe_buft_lists[tn.bid % pimpl->cpu_moe_buft_lists.size()];
+    }
     const buft_list_t * buft_list_layer = tn.bid == -1 ? nullptr : pimpl->dev_layer.at(tn.bid).buft_list;
     return ml.create_tensor(
-        hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list, buft_list_layer,
+        hparams, buft_list_cpu, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list, buft_list_layer,
         tn, ne, flags);
 }
 

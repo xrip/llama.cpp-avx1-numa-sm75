@@ -698,6 +698,9 @@ struct llama_model {
     // list of devices used in this model
     std::vector<llama_device> devices;
 
+    std::vector<llama_device> cpu_moe_devices;
+    std::vector<bool>         cpu_moe_devices_used;
+
     // for quantize-stats only
     std::vector<std::pair<std::string, struct ggml_tensor *>> tensors_by_name;
 

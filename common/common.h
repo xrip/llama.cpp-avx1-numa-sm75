@@ -345,8 +345,10 @@ struct common_params_speculative_draft {
     common_cpu_params cpuparams_batch;
 
     std::vector<ggml_backend_dev_t> devices; // devices to use for offloading
+    std::string                     devices_arg; // raw -devd value, resolved after parsing
 
     std::vector<llama_model_tensor_buft_override> tensor_buft_overrides;
+    std::vector<std::string>                      tensor_buft_override_specs; // raw values, resolved after parsing
 };
 
 struct common_params_speculative_ngram_mod {
@@ -469,6 +471,7 @@ struct common_params {
 
     // offload params
     std::vector<ggml_backend_dev_t> devices; // devices to use for offloading
+    std::string                     devices_arg; // raw -dev value, resolved after parsing
 
     int32_t n_gpu_layers       = -1;    // number of layers to store in VRAM, -1 is auto, <= -2 is all
     int32_t main_gpu           = 0;     // the GPU that is used for scratch and small tensors
@@ -525,6 +528,7 @@ struct common_params {
     std::vector<std::string> antiprompt; // strings upon which more user input is prompted (a.k.a. reverse prompts)
     std::vector<llama_model_kv_override> kv_overrides;
     std::vector<llama_model_tensor_buft_override> tensor_buft_overrides;
+    std::vector<std::string> tensor_buft_override_specs; // raw -ot/-cmoe values, resolved after parsing
 
     bool lora_init_without_apply = false; // only load lora to memory, but do not apply it to ctx (user can manually apply lora later using llama_adapter_lora_apply)
     std::vector<common_adapter_lora_info> lora_adapters; // lora adapter path with user defined scale
@@ -555,6 +559,8 @@ struct common_params {
 
     bool usage             = false; // print usage
     bool completion        = false; // print source-able completion script
+    bool list_devices      = false; // print available devices and exit, after parsing
+    std::vector<std::string> no_gpu_warnings; // held back until it is known whether --numa split provides devices
     bool use_color         = false; // use color to distinguish generations and inputs
     bool special           = false; // enable special token output
     bool interactive       = false; // interactive mode
@@ -763,6 +769,9 @@ void common_init();
 
 void common_params_print_info(const common_params & params, bool print_devices = true);
 std::string common_params_get_system_info(const common_params & params);
+
+// NUMA node a device is bound to, -1 if it is not one of the --numa split devices
+int common_dev_numa_node(ggml_backend_dev_t dev);
 
 bool parse_cpu_range(const std::string & range, bool(&boolmask)[GGML_MAX_N_THREADS]);
 bool parse_cpu_mask(const std::string & mask, bool(&boolmask)[GGML_MAX_N_THREADS]);

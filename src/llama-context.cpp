@@ -337,6 +337,19 @@ llama_context::llama_context(
             backends.emplace_back(backend);
         }
 
+        for (size_t i = 0; i < model.cpu_moe_devices.size(); ++i) {
+            if (!model.cpu_moe_devices_used[i]) {
+                continue;
+            }
+            ggml_backend_dev_t dev = model.cpu_moe_devices[i].dev;
+            ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
+            if (backend == nullptr) {
+                throw std::runtime_error(format("failed to initialize %s backend", ggml_backend_dev_name(dev)));
+            }
+            LLAMA_LOG_INFO("%s: using %s for CPU MoE\n", __func__, ggml_backend_dev_name(dev));
+            backends.emplace_back(backend);
+        }
+
         // add ACCEL backends (such as BLAS)
         for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
             ggml_backend_dev_t dev = ggml_backend_dev_get(i);
@@ -363,7 +376,12 @@ llama_context::llama_context(
             if (reg) {
                 auto ggml_backend_set_n_threads_fn = (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
                 if (ggml_backend_set_n_threads_fn) {
-                    set_n_threads_fns.emplace_back(backend.get(), ggml_backend_set_n_threads_fn);
+                    // the NUMA node backends run at the same time, so they split one thread budget between them
+                    if (backend.get() != backend_cpu && llama_dev_numa_node(dev) >= 0) {
+                        backends_numa.emplace_back(backend.get());
+                    } else {
+                        set_n_threads_fns.emplace_back(backend.get(), ggml_backend_set_n_threads_fn);
+                    }
                 }
             }
         }
@@ -407,7 +425,11 @@ llama_context::llama_context(
             auto * buft = ggml_backend_get_default_buffer_type(backend.get());
             auto backend_type = ggml_backend_dev_type(ggml_backend_get_device(backend.get()));
 
-            if (backend_type == GGML_BACKEND_DEVICE_TYPE_CPU && !model.devices.empty()) {
+            // NUMA node backends only accept their own buffer types, everything else would put
+            // their tensors on the wrong node, so they keep their default
+            const bool is_numa_backend = llama_dev_numa_node(ggml_backend_get_device(backend.get())) >= 0;
+
+            if (backend_type == GGML_BACKEND_DEVICE_TYPE_CPU && !is_numa_backend && !model.devices.empty()) {
                 // use the host buffer of the first device CPU for faster transfer of the intermediate state
                 const auto & dev = model.devices[0];
                 auto * host_buft = ggml_backend_dev_host_buffer_type(dev.dev);
@@ -2504,6 +2526,10 @@ ggml_status llama_context::graph_compute(
     // set the number of threads for all the backends
     for (const auto & set_n_threads_fn : set_n_threads_fns) {
         set_n_threads_fn.second(set_n_threads_fn.first, n_threads);
+    }
+
+    if (!backends_numa.empty()) {
+        ggml_backend_set_n_threads_total(backends_numa.data(), backends_numa.size(), n_threads);
     }
 
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);

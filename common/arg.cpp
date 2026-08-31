@@ -759,6 +759,8 @@ static void common_params_apply_system_config(common_params & params, llama_exam
     }
 }
 
+static std::vector<ggml_backend_dev_t> parse_device_list(const std::string & value);
+
 static bool common_params_parse_ex(int argc, char ** argv, common_params_context & ctx_arg) {
     common_params & params = ctx_arg.params;
 
@@ -893,6 +895,49 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
 
     postprocess_cpu_params(params.speculative.draft.cpuparams,       &params.cpuparams);
     postprocess_cpu_params(params.speculative.draft.cpuparams_batch, &params.cpuparams_batch);
+
+    // devices and tensor buffer overrides resolve only now: under --numa split the node devices
+    // exist only after initialization, and this way the arguments work in any order. skipped for
+    // usage/completion, which exit without using them
+    if (!params.usage && !params.completion) {
+        bool numa_devices = false;
+        if (params.numa == GGML_NUMA_STRATEGY_SPLIT) {
+            // the CPU backend is a shared library in some builds, it has to be loaded before it can be asked
+            ggml_backend_load_all();
+            const enum llama_numa_init_status status = llama_numa_init_ex(GGML_NUMA_STRATEGY_SPLIT);
+            if (status == LLAMA_NUMA_INIT_STATUS_FAILED) {
+                throw std::runtime_error("--numa split could not be initialized");
+            }
+            numa_devices = status == LLAMA_NUMA_INIT_STATUS_SUCCESS;
+        }
+
+        // with the NUMA node devices the GPU oriented options work as usual, without them the
+        // handlers' warnings about their lack of effect hold and are printed now
+        if (!numa_devices) {
+            for (const auto & warning : params.no_gpu_warnings) {
+                fprintf(stderr, "%s", warning.c_str());
+            }
+        }
+
+        if (!params.devices_arg.empty()) {
+            params.devices = parse_device_list(params.devices_arg);
+        }
+        if (!params.speculative.draft.devices_arg.empty()) {
+            params.speculative.draft.devices = parse_device_list(params.speculative.draft.devices_arg);
+        }
+        for (const auto & spec : params.tensor_buft_override_specs) {
+            parse_tensor_buffer_overrides(spec, params.tensor_buft_overrides);
+        }
+        for (const auto & spec : params.speculative.draft.tensor_buft_override_specs) {
+            parse_tensor_buffer_overrides(spec, params.speculative.draft.tensor_buft_overrides);
+        }
+
+        if (params.list_devices) {
+            common_print_available_devices();
+            exit(0);
+        }
+    }
+
 
     if (params.prompt_cache_all && (params.interactive || params.interactive_first)) {
         throw std::invalid_argument("error: --prompt-cache-all not supported in interactive mode yet\n");
@@ -1125,8 +1170,9 @@ static std::vector<ggml_backend_dev_t> parse_device_list(const std::string & val
         ggml_backend_load_all();
         for (const auto & device : dev_names) {
             auto * dev = ggml_backend_dev_by_name(device.c_str());
-            if (!dev || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
-                throw std::invalid_argument(string_format("invalid device: %s", device.c_str()));
+            if (!dev || (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU && common_dev_numa_node(dev) < 0)) {
+                throw std::invalid_argument(string_format("invalid device: %s%s", device.c_str(),
+                            dev == nullptr ? " (NUMA CPU devices need --numa split)" : ""));
             }
             devices.push_back(dev);
         }
@@ -1143,7 +1189,7 @@ void common_print_available_devices() {
 
     for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
         auto * dev = ggml_backend_dev_get(i);
-        if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+        if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU || common_dev_numa_node(dev) >= 0) {
             devices.push_back(dev);
         }
     }
@@ -2747,12 +2793,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "- distribute: spread execution evenly over all nodes\n"
         "- isolate: only spawn threads on CPUs on the node that execution started on\n"
         "- numactl: use the CPU map provided by numactl\n"
+        "- split: expose every NUMA node as its own device, CPU0, CPU1 ... , so that -dev, -ot and the split modes\n"
+        "  can place weights and threads per node. Linux only, -t is the total over the nodes in use\n"
         "if run without this previously, it is recommended to drop the system page cache before using this\n"
         "see https://github.com/ggml-org/llama.cpp/issues/1437",
         [](common_params & params, const std::string & value) {
             /**/ if (value == "distribute" || value == "") { params.numa = GGML_NUMA_STRATEGY_DISTRIBUTE; }
             else if (value == "isolate") { params.numa = GGML_NUMA_STRATEGY_ISOLATE; }
             else if (value == "numactl") { params.numa = GGML_NUMA_STRATEGY_NUMACTL; }
+            else if (value == "split") { params.numa = GGML_NUMA_STRATEGY_SPLIT; }
             else { throw std::invalid_argument("invalid value"); }
         }
     ).set_env("LLAMA_ARG_NUMA"));
@@ -2761,28 +2810,30 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "comma-separated list of devices to use for offloading (none = don't offload)\n"
         "use --list-devices to see a list of available devices",
         [](common_params & params, const std::string & value) {
-            params.devices = parse_device_list(value);
+            // resolved after parsing, the available devices can depend on other arguments (--numa split)
+            params.devices_arg = value;
         }
     ).set_env("LLAMA_ARG_DEVICE"));
     add_opt(common_arg(
         {"--list-devices"},
         "print list of available devices and exit",
-        [](common_params &) {
-            common_print_available_devices();
-            exit(0);
+        [](common_params & params) {
+            // printed after parsing so that the list reflects --numa split in any argument order
+            params.list_devices = true;
         }
     ));
     add_opt(common_arg(
         {"-ot", "--override-tensor"}, "<tensor name pattern>=<buffer type>,...",
         "override tensor buffer type", [](common_params & params, const std::string & value) {
-            parse_tensor_buffer_overrides(value, params.tensor_buft_overrides);
+            // resolved after parsing, the available buffer types can depend on other arguments (--numa split)
+            params.tensor_buft_override_specs.push_back(value);
         }
     ).set_env("LLAMA_ARG_OVERRIDE_TENSOR"));
     add_opt(common_arg(
         {"-cmoe", "--cpu-moe"},
         "keep all Mixture of Experts (MoE) weights in the CPU",
         [](common_params & params) {
-            params.tensor_buft_overrides.push_back(llm_ffn_exps_cpu_override());
+            params.tensor_buft_override_specs.push_back(std::string(LLM_FFN_EXPS_REGEX) + "=CPU");
         }
     ).set_env("LLAMA_ARG_CPU_MOE"));
     add_opt(common_arg(
@@ -2819,9 +2870,10 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 params.n_gpu_layers = std::stoi(value);
             }
             if (!llama_supports_gpu_offload()) {
-                fprintf(stderr, "warning: no usable GPU found, --gpu-layers option will be ignored\n");
-                fprintf(stderr, "warning: one possible reason is that llama.cpp was compiled without GPU support\n");
-                fprintf(stderr, "warning: consult docs/build.md for compilation instructions\n");
+                params.no_gpu_warnings.push_back(
+                    "warning: no usable GPU found, --gpu-layers option will be ignored\n"
+                    "warning: one possible reason is that llama.cpp was compiled without GPU support\n"
+                    "warning: consult docs/build.md for compilation instructions\n");
             }
         }
     ).set_env("LLAMA_ARG_N_GPU_LAYERS"));
@@ -2845,7 +2897,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 throw std::invalid_argument("invalid value");
             }
             if (!llama_supports_gpu_offload()) {
-                fprintf(stderr, "warning: llama.cpp was compiled without support for GPU offload. Setting the split mode has no effect.\n");
+                params.no_gpu_warnings.push_back("warning: llama.cpp was compiled without support for GPU offload. Setting the split mode has no effect.\n");
             }
         }
     ).set_env("LLAMA_ARG_SPLIT_MODE"));
@@ -2872,7 +2924,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 }
             }
             if (!llama_supports_gpu_offload()) {
-                fprintf(stderr, "warning: llama.cpp was compiled without support for GPU offload. Setting a tensor split has no effect.\n");
+                params.no_gpu_warnings.push_back("warning: llama.cpp was compiled without support for GPU offload. Setting a tensor split has no effect.\n");
             }
         }
     ).set_env("LLAMA_ARG_TENSOR_SPLIT"));
@@ -2882,7 +2934,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, int value) {
             params.main_gpu = value;
             if (!llama_supports_gpu_offload()) {
-                fprintf(stderr, "warning: llama.cpp was compiled without support for GPU offload. Setting the main GPU has no effect.\n");
+                params.no_gpu_warnings.push_back("warning: llama.cpp was compiled without support for GPU offload. Setting the main GPU has no effect.\n");
             }
         }
     ).set_env("LLAMA_ARG_MAIN_GPU"));
@@ -4115,14 +4167,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--spec-draft-override-tensor", "-otd", "--override-tensor-draft"}, "<tensor name pattern>=<buffer type>,...",
         "override tensor buffer type for draft model", [](common_params & params, const std::string & value) {
-            parse_tensor_buffer_overrides(value, params.speculative.draft.tensor_buft_overrides);
+            params.speculative.draft.tensor_buft_override_specs.push_back(value);
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
         {"--spec-draft-cpu-moe", "-cmoed", "--cpu-moe-draft"},
         "keep all Mixture of Experts (MoE) weights in the CPU for the draft model",
         [](common_params & params) {
-            params.speculative.draft.tensor_buft_overrides.push_back(llm_ffn_exps_cpu_override());
+            params.speculative.draft.tensor_buft_override_specs.push_back(std::string(LLM_FFN_EXPS_REGEX) + "=CPU");
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_CPU_MOE"));
     add_opt(common_arg(
@@ -4214,7 +4266,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "comma-separated list of devices to use for offloading the draft model (none = don't offload)\n"
         "use --list-devices to see a list of available devices",
         [](common_params & params, const std::string & value) {
-            params.speculative.draft.devices = parse_device_list(value);
+            params.speculative.draft.devices_arg = value;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     GGML_ASSERT(params.speculative.draft.n_gpu_layers < 0); // string_format would need to be extended for a default >= 0
@@ -4231,9 +4283,10 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 params.speculative.draft.n_gpu_layers = std::stoi(value);
             }
             if (!llama_supports_gpu_offload()) {
-                fprintf(stderr, "warning: no usable GPU found, --gpu-layers-draft option will be ignored\n");
-                fprintf(stderr, "warning: one possible reason is that llama.cpp was compiled without GPU support\n");
-                fprintf(stderr, "warning: consult docs/build.md for compilation instructions\n");
+                params.no_gpu_warnings.push_back(
+                    "warning: no usable GPU found, --gpu-layers-draft option will be ignored\n"
+                    "warning: one possible reason is that llama.cpp was compiled without GPU support\n"
+                    "warning: consult docs/build.md for compilation instructions\n");
             }
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_N_GPU_LAYERS_DRAFT"));

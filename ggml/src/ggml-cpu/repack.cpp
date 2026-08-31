@@ -16,6 +16,12 @@
 #include <cassert>
 #include <cstdio>  // for GGML_ASSERT
 #include <type_traits>
+#include <memory>
+#include <map>
+#include <mutex>
+#include <string>
+#include <utility>
+#include <vector>
 
 #include "repack.h"
 
@@ -4846,20 +4852,50 @@ static void ggml_backend_cpu_repack_buffer_set_tensor(ggml_backend_buffer_t buff
     GGML_ASSERT(size == ggml_nbytes(tensor));
 
     auto tensor_traits = (ggml::cpu::repack::tensor_traits_base *) tensor->extra;
-    auto OK            = tensor_traits->repack(tensor, data, size);
+    if (tensor_traits == nullptr) {
+        // this tensor did not qualify for repacking (see init_tensor), e.g. a tensor-split shard
+        // whose row count does not divide evenly. it is stored as plain data; the compute path
+        // makes the same decision from the tensor's type and shape and uses the normal kernels
+        GGML_LOG_WARN("%s: tensor %s was not repacked\n", __func__, tensor->name);
+        memcpy(tensor->data, data, size);
+        return;
+    }
+    auto OK = tensor_traits->repack(tensor, data, size);
 
     GGML_ASSERT(OK == 0);
     GGML_UNUSED(buffer);
 }
 
-static const char * ggml_backend_cpu_repack_buffer_type_get_name(ggml_backend_buffer_type_t buft) {
-    return "CPU_REPACK";
+// names of the per device repack buffer type instances, see ggml_backend_cpu_repack_buffer_type_for_device
+static std::mutex & ggml_backend_cpu_repack_buffer_type_mutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+static std::map<const ggml_backend_buffer_type *, std::string> & ggml_backend_cpu_repack_buffer_type_names() {
+    static std::map<const ggml_backend_buffer_type *, std::string> names;
+    return names;
+}
 
-    GGML_UNUSED(buft);
+static const char * ggml_backend_cpu_repack_buffer_type_get_name(ggml_backend_buffer_type_t buft) {
+    // a per device instance is named after its device ("CPU0_REPACK"): several maps (e.g. the
+    // llama model loader) key buffer types by name, so the per node instances must not collide
+    std::lock_guard<std::mutex> lock(ggml_backend_cpu_repack_buffer_type_mutex());
+    const auto & names = ggml_backend_cpu_repack_buffer_type_names();
+    const auto   it    = names.find(buft);
+    if (it != names.end()) {
+        return it->second.c_str();
+    }
+    return "CPU_REPACK";
+}
+
+bool ggml_backend_cpu_buft_is_repack(ggml_backend_buffer_type_t buft) {
+    return buft != nullptr && buft->iface.get_name == ggml_backend_cpu_repack_buffer_type_get_name;
 }
 
 static ggml_backend_buffer_t ggml_backend_cpu_repack_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
-    ggml_backend_buffer_t buffer = ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), size);
+    // route through the memory of the owning device, so a per node repack buffer is node local.
+    // for the default repack buffer this is the plain CPU buffer type, i.e. unchanged.
+    ggml_backend_buffer_t buffer = ggml_backend_buft_alloc_buffer(ggml_backend_dev_buffer_type(buft->device), size);
 
     if (buffer == nullptr) {
         return nullptr;
@@ -4885,7 +4921,7 @@ class extra_buffer_type : ggml::cpu::extra_buffer_type {
         if (    op->op == GGML_OP_MUL_MAT &&
                 op->src[0]->buffer &&
                 (ggml_n_dims(op->src[0]) == 2) &&
-                op->src[0]->buffer->buft == ggml_backend_cpu_repack_buffer_type() &&
+                ggml_backend_cpu_buft_is_repack(op->src[0]->buffer->buft) &&
                 ggml_repack_get_optimal_repack_type(op->src[0])
                 ) {
             if (op->src[1]->buffer && !ggml_backend_buft_is_host(op->src[1]->buffer->buft)) {
@@ -4901,7 +4937,7 @@ class extra_buffer_type : ggml::cpu::extra_buffer_type {
         } else if (op->op == GGML_OP_MUL_MAT_ID
                 && op->src[0]->buffer
                 && (ggml_n_dims(op->src[0]) == 3)
-                && op->src[0]->buffer->buft == ggml_backend_cpu_repack_buffer_type()
+                && ggml_backend_cpu_buft_is_repack(op->src[0]->buffer->buft)
                 && ggml_repack_get_optimal_repack_type(op->src[0])
                 ) {
             if (op->src[1]->buffer && !ggml_backend_buft_is_host(op->src[1]->buffer->buft)) {
@@ -4919,7 +4955,7 @@ class extra_buffer_type : ggml::cpu::extra_buffer_type {
 
     ggml::cpu::tensor_traits * get_tensor_traits(const struct ggml_tensor * op) override {
         if (op->op == GGML_OP_MUL_MAT || op->op == GGML_OP_MUL_MAT_ID) {
-            if (op->src[0]->buffer && op->src[0]->buffer->buft == ggml_backend_cpu_repack_buffer_type()) {
+            if (op->src[0]->buffer && ggml_backend_cpu_buft_is_repack(op->src[0]->buffer->buft)) {
                 return (ggml::cpu::tensor_traits *) op->src[0]->extra;
             }
         }
@@ -4943,4 +4979,53 @@ ggml_backend_buffer_type_t ggml_backend_cpu_repack_buffer_type(void) {
     };
 
     return &ggml_backend_cpu_buffer_type_repack;
+}
+
+// one repack buffer type per device, kept alive for the process
+static std::mutex & ggml_backend_cpu_repack_buffer_type_for_device_mutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+static std::vector<std::pair<ggml_backend_dev_t, std::unique_ptr<ggml_backend_buffer_type>>> & ggml_backend_cpu_repack_buffer_type_for_device_bufts() {
+    static std::vector<std::pair<ggml_backend_dev_t, std::unique_ptr<ggml_backend_buffer_type>>> bufts;
+    return bufts;
+}
+
+ggml_backend_buffer_type_t ggml_backend_cpu_repack_buffer_type_for_device(ggml_backend_dev_t dev) {
+    std::lock_guard<std::mutex> lock(ggml_backend_cpu_repack_buffer_type_for_device_mutex());
+    auto & bufts = ggml_backend_cpu_repack_buffer_type_for_device_bufts();
+
+    for (const auto & [d, buft] : bufts) {
+        if (d == dev) {
+            return buft.get();
+        }
+    }
+
+    auto buft = std::make_unique<ggml_backend_buffer_type>();
+    *buft = *ggml_backend_cpu_repack_buffer_type();
+    buft->device = dev;
+    {
+        std::lock_guard<std::mutex> name_lock(ggml_backend_cpu_repack_buffer_type_mutex());
+        ggml_backend_cpu_repack_buffer_type_names().emplace(
+            buft.get(), std::string(ggml_backend_dev_name(dev)) + "_REPACK");
+    }
+
+    bufts.emplace_back(dev, std::move(buft));
+    return bufts.back().second.get();
+}
+
+void ggml_backend_cpu_repack_buffer_type_forget_device(ggml_backend_dev_t dev) {
+    // for a device that is being destroyed without ever becoming visible (a failed --numa split
+    // initialization); otherwise the registry would keep a buffer type keyed by a dangling device
+    std::lock_guard<std::mutex> lock(ggml_backend_cpu_repack_buffer_type_for_device_mutex());
+    auto & bufts = ggml_backend_cpu_repack_buffer_type_for_device_bufts();
+
+    for (auto it = bufts.begin(); it != bufts.end(); ++it) {
+        if (it->first == dev) {
+            std::lock_guard<std::mutex> name_lock(ggml_backend_cpu_repack_buffer_type_mutex());
+            ggml_backend_cpu_repack_buffer_type_names().erase(it->second.get());
+            bufts.erase(it);
+            return;
+        }
+    }
 }

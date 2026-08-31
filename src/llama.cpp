@@ -133,15 +133,56 @@ void llama_backend_init(void) {
     }
 }
 
-void llama_numa_init(enum ggml_numa_strategy numa) {
-    if (numa != GGML_NUMA_STRATEGY_DISABLED) {
-        auto * dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
-        GGML_ASSERT(dev && "CPU backend is not loaded");
-        auto * reg = ggml_backend_dev_backend_reg(dev);
-        auto * numa_init_fn = (decltype(ggml_numa_init) *) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_numa_init");
-        if (numa_init_fn) {
-            numa_init_fn(numa);
+enum llama_numa_init_status llama_numa_init_ex(enum ggml_numa_strategy numa) {
+    if (numa == GGML_NUMA_STRATEGY_DISABLED) {
+        return LLAMA_NUMA_INIT_STATUS_SUCCESS;
+    }
+
+    auto * dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    GGML_ASSERT(dev && "CPU backend is not loaded");
+    auto * reg = ggml_backend_dev_backend_reg(dev);
+
+    // split does not go through ggml_numa_init: it must not turn on the global thread affinity handling,
+    // which would override the per node thread pools on every graph
+    if (numa == GGML_NUMA_STRATEGY_SPLIT) {
+        auto * split_init_fn = (ggml_backend_cpu_numa_split_init_t)
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_numa_split_init");
+        if (split_init_fn == nullptr) {
+            LLAMA_LOG_WARN("%s: --numa split is not supported by this build, continuing without NUMA optimizations\n", __func__);
+            return LLAMA_NUMA_INIT_STATUS_UNAVAILABLE;
         }
+
+        // the CPU backend creates the node devices but cannot register them itself (a backend
+        // does not link against the registry), so they are registered here. calls after the
+        // first return no devices, so the registration cannot happen twice
+        ggml_backend_dev_t node_devs[GGML_CPU_NUMA_SPLIT_MAX_DEVICES];
+        size_t             n_node_devs = sizeof(node_devs)/sizeof(node_devs[0]);
+
+        const enum ggml_numa_split_status status = split_init_fn(node_devs, &n_node_devs);
+        for (size_t i = 0; i < n_node_devs; i++) {
+            ggml_backend_device_register(node_devs[i]);
+        }
+
+        switch (status) {
+            case GGML_NUMA_SPLIT_STATUS_SUCCESS:     return LLAMA_NUMA_INIT_STATUS_SUCCESS;
+            case GGML_NUMA_SPLIT_STATUS_UNAVAILABLE: return LLAMA_NUMA_INIT_STATUS_UNAVAILABLE;
+            case GGML_NUMA_SPLIT_STATUS_FAILED:      return LLAMA_NUMA_INIT_STATUS_FAILED;
+        }
+        GGML_ABORT("invalid numa split status");
+    }
+
+    auto * numa_init_fn = (decltype(ggml_numa_init) *) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_numa_init");
+    if (numa_init_fn) {
+        numa_init_fn(numa);
+    }
+
+    return LLAMA_NUMA_INIT_STATUS_SUCCESS;
+}
+
+void llama_numa_init(enum ggml_numa_strategy numa) {
+    if (llama_numa_init_ex(numa) == LLAMA_NUMA_INIT_STATUS_FAILED) {
+        // llama_numa_init_ex has already logged the reason
+        GGML_ABORT("llama_numa_init: failed to initialize the requested NUMA strategy");
     }
 }
 
@@ -188,17 +229,27 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
         std::vector<llama_device> gpus;
         std::vector<llama_device> igpus;
         std::vector<llama_device> rpc_servers;
+        std::vector<llama_device> numa_cpus; // --numa split node devices
 
         if (params.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
-            std::vector<ggml_backend_dev_t> devs;
-            devs.reserve(ggml_backend_dev_count());
+            std::vector<ggml_backend_dev_t> accel_devs;
+            std::vector<ggml_backend_dev_t> numa_devs;
             for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
                 auto * dev = ggml_backend_dev_get(i);
-                if (ggml_backend_dev_buffer_type(dev) == ggml_backend_cpu_buffer_type()) {
+                if (llama_dev_numa_node(dev) >= 0) {
+                    // a --numa split node device, used only if there is no accelerator
+                    numa_devs.push_back(dev);
+                } else if (ggml_backend_dev_buffer_type(dev) == ggml_backend_cpu_buffer_type()) {
                     LLAMA_LOG_INFO("%s: skipping %s (%s) for tensor parallelism\n", __func__, ggml_backend_dev_name(dev), ggml_backend_dev_description(dev));
-                    continue;
+                } else {
+                    accel_devs.push_back(dev);
                 }
-                devs.push_back(dev);
+            }
+            // prefer accelerators, fall back to the NUMA node devices
+            std::vector<ggml_backend_dev_t> & devs = accel_devs.empty() ? numa_devs : accel_devs;
+            if (!accel_devs.empty() && !numa_devs.empty()) {
+                LLAMA_LOG_INFO("%s: %zu NUMA CPU device(s) available for -dev but not auto-used for tensor parallelism because accelerators are present\n",
+                        __func__, numa_devs.size());
             }
             if (devs.empty()) {
                 LLAMA_LOG_ERROR("%s: LLAMA_SPLIT_MODE_TENSOR needs >= 1 devices\n", __func__);
@@ -222,6 +273,11 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
                 ggml_backend_dev_t dev = ggml_backend_dev_get(i);
                 switch (ggml_backend_dev_type(dev)) {
                     case GGML_BACKEND_DEVICE_TYPE_CPU:
+                        // a --numa split node device is a real placement target, the plain CPU is handled separately
+                        if (llama_dev_numa_node(dev) >= 0) {
+                            numa_cpus.push_back({false, dev});
+                        }
+                        break;
                     case GGML_BACKEND_DEVICE_TYPE_ACCEL:
                         // skip CPU backends since they are handled separately
                         break;
@@ -282,6 +338,17 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
         if (gpus.empty()) {
             model->devices.insert(model->devices.end(), igpus.begin(), igpus.end());
         }
+
+        // use the --numa split node devices to distribute layers only if there is no accelerator.
+        // with an accelerator present they stay available for explicit -dev / -ot placement.
+        if (!numa_cpus.empty()) {
+            if (model->devices.empty()) {
+                model->devices.insert(model->devices.end(), numa_cpus.begin(), numa_cpus.end());
+            } else {
+                LLAMA_LOG_INFO("%s: %zu NUMA CPU device(s) available for -dev/-ot but not auto-used because accelerators are present\n",
+                        __func__, numa_cpus.size());
+            }
+        }
     }
 
     // if using single GPU mode, remove all except the main GPU
@@ -296,6 +363,36 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
             llama_device main_gpu = model->devices[params.main_gpu];
             model->devices.clear();
             model->devices.push_back(main_gpu);
+        }
+    }
+
+    const bool has_accelerator = std::any_of(model->devices.begin(), model->devices.end(), [](const llama_device & dev) {
+        const auto type = ggml_backend_dev_type(dev.dev);
+        return type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU;
+    });
+
+    bool has_cpu_override = false;
+    if (params.tensor_buft_overrides != nullptr) {
+        for (const auto * cur = params.tensor_buft_overrides; cur->pattern != nullptr; ++cur) {
+            if (cur->buft == ggml_backend_cpu_buffer_type()) {
+                has_cpu_override = true;
+                break;
+            }
+        }
+    }
+
+    if (has_accelerator && has_cpu_override) {
+        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+            if (llama_dev_numa_node(dev) >= 0) {
+                model->cpu_moe_devices.push_back({false, dev});
+            }
+        }
+        if (model->cpu_moe_devices.size() < 2) {
+            model->cpu_moe_devices.clear();
+        } else {
+            model->cpu_moe_devices_used.resize(model->cpu_moe_devices.size(), false);
+            LLAMA_LOG_INFO("%s: using %zu NUMA CPU devices for CPU MoE layer placement\n", __func__, model->cpu_moe_devices.size());
         }
     }
 
