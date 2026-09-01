@@ -561,12 +561,113 @@ static inline void iqp_interleave_x8(int8_t * GGML_RESTRICT dst, const int8_t (*
 
 #endif
 
+#if defined(__AVX__) && !defined(__AVX2__)
+
+static inline void iqp_store_transposed_4x4_avx1(
+        int8_t * GGML_RESTRICT dst,
+        int                    row_offset,
+        __m128i                r0,
+        __m128i                r1,
+        __m128i                r2,
+        __m128i                r3) {
+    const __m128i a0 = _mm_unpacklo_epi32(r0, r1);
+    const __m128i a1 = _mm_unpackhi_epi32(r0, r1);
+    const __m128i a2 = _mm_unpacklo_epi32(r2, r3);
+    const __m128i a3 = _mm_unpackhi_epi32(r2, r3);
+
+    _mm_storeu_si128((__m128i *) (dst + 0 * 32 + row_offset), _mm_unpacklo_epi64(a0, a2));
+    _mm_storeu_si128((__m128i *) (dst + 1 * 32 + row_offset), _mm_unpackhi_epi64(a0, a2));
+    _mm_storeu_si128((__m128i *) (dst + 2 * 32 + row_offset), _mm_unpacklo_epi64(a1, a3));
+    _mm_storeu_si128((__m128i *) (dst + 3 * 32 + row_offset), _mm_unpackhi_epi64(a1, a3));
+}
+
+static inline void iqp_decode_iq4_xs_rows_4_avx1(
+        const block_iq4_xs * x0,
+        const block_iq4_xs * x1,
+        const block_iq4_xs * x2,
+        const block_iq4_xs * x3,
+        int                  ib,
+        int                  row_offset,
+        int8_t *             dst_lo,
+        int8_t *             dst_hi) {
+    const __m128i lut = _mm_loadu_si128((const __m128i *) kvalues_iq4nl);
+    const __m128i m4  = _mm_set1_epi8(0x0f);
+
+    const __m128i q0 = _mm_loadu_si128((const __m128i *) (x0->qs + 16 * ib));
+    const __m128i q1 = _mm_loadu_si128((const __m128i *) (x1->qs + 16 * ib));
+    const __m128i q2 = _mm_loadu_si128((const __m128i *) (x2->qs + 16 * ib));
+    const __m128i q3 = _mm_loadu_si128((const __m128i *) (x3->qs + 16 * ib));
+
+    iqp_store_transposed_4x4_avx1(dst_lo, row_offset,
+                                  _mm_shuffle_epi8(lut, _mm_and_si128(q0, m4)),
+                                  _mm_shuffle_epi8(lut, _mm_and_si128(q1, m4)),
+                                  _mm_shuffle_epi8(lut, _mm_and_si128(q2, m4)),
+                                  _mm_shuffle_epi8(lut, _mm_and_si128(q3, m4)));
+
+    iqp_store_transposed_4x4_avx1(dst_hi, row_offset,
+                                  _mm_shuffle_epi8(lut, _mm_and_si128(_mm_srli_epi16(q0, 4), m4)),
+                                  _mm_shuffle_epi8(lut, _mm_and_si128(_mm_srli_epi16(q1, 4), m4)),
+                                  _mm_shuffle_epi8(lut, _mm_and_si128(_mm_srli_epi16(q2, 4), m4)),
+                                  _mm_shuffle_epi8(lut, _mm_and_si128(_mm_srli_epi16(q3, 4), m4)));
+}
+
+static void iqp_decode_panel_8_iq4_xs_avx1(
+        const char * GGML_RESTRICT   src,
+        size_t                       nb01,
+        int64_t                      nblocks,
+        block_iqp_x8 * GGML_RESTRICT dst) {
+    const block_iq4_xs * rows[IQP_NB_ROWS];
+
+    for (int r = 0; r < IQP_NB_ROWS; ++r) {
+        rows[r] = (const block_iq4_xs *) (src + r * nb01);
+    }
+
+    for (int64_t x = 0; x < nblocks; ++x) {
+        for (int r = 0; r < IQP_NB_ROWS; ++r) {
+            const block_iq4_xs * b = rows[r] + x;
+            uint16_t sh = b->scales_h;
+
+            dst->dfac[r] = GGML_CPU_FP16_TO_FP32(b->d);
+
+            for (int ib = 0; ib < QK_K / 32; ++ib) {
+                const int ls = ((b->scales_l[ib / 2] >> (4 * (ib % 2))) & 0xf) | ((sh & 3) << 4);
+                const int8_t dl = (int8_t) (ls - 32);
+
+                sh >>= 2;
+                dst->iscales[(2 * ib + 0) * IQP_NB_ROWS + r] = dl;
+                dst->iscales[(2 * ib + 1) * IQP_NB_ROWS + r] = dl;
+            }
+        }
+
+        for (int ib = 0; ib < QK_K / 32; ++ib) {
+            int8_t * dst_lo = dst->qs + (2 * ib + 0) * 128;
+            int8_t * dst_hi = dst->qs + (2 * ib + 1) * 128;
+
+            iqp_decode_iq4_xs_rows_4_avx1(rows[0] + x, rows[1] + x, rows[2] + x, rows[3] + x, ib, 0,
+                                          dst_lo, dst_hi);
+            iqp_decode_iq4_xs_rows_4_avx1(rows[4] + x, rows[5] + x, rows[6] + x, rows[7] + x, ib, 16,
+                                          dst_lo, dst_hi);
+        }
+
+        ++dst;
+    }
+}
+
+#endif  // defined(__AVX__) && !defined(__AVX2__)
+
 // decode IQP_NB_ROWS consecutive source rows (starting at src, row stride nb01) into a panel of nblocks block_iqp_x8
 static void iqp_decode_panel_8(enum ggml_type               type,
                                const char * GGML_RESTRICT   src,
                                size_t                       nb01,
                                int64_t                      nblocks,
                                block_iqp_x8 * GGML_RESTRICT dst) {
+#if defined(__AVX__) && !defined(__AVX2__)
+    if (type == GGML_TYPE_IQ4_XS) {
+        iqp_decode_panel_8_iq4_xs_avx1(src, nb01, nblocks, dst);
+        return;
+    }
+#endif
+
     const size_t bsize = ggml_type_size(type);
 
     int8_t vals[IQP_NB_ROWS][QK_K];
@@ -931,6 +1032,172 @@ static inline void iqp_gemm_tile_4(int                                nb,
 
 #endif  // __AVX2__
 
+#if defined(__AVX__) && !defined(__AVX2__)
+
+struct iqp_i32x8_avx1 {
+    __m128i lo;
+    __m128i hi;
+};
+
+static inline __m256i iqp_join_i32x8_avx1(__m128i lo, __m128i hi) {
+    return _mm256_insertf128_si256(_mm256_castsi128_si256(lo), hi, 1);
+}
+
+static inline void iqp_dot4_scaled_1_avx1(
+        __m128i   xv,
+        __m128i   yv,
+        __m128i   scale,
+        __m128i & acc) {
+    const __m128i ax = _mm_abs_epi8(xv);
+    const __m128i sy = _mm_sign_epi8(yv, xv);
+
+    acc = _mm_add_epi32(acc, _mm_madd_epi16(_mm_maddubs_epi16(ax, sy), scale));
+}
+
+static inline void iqp_dot4_scaled_2_avx1(
+        __m128i   xv,
+        __m128i   y0,
+        __m128i   y1,
+        __m128i   scale,
+        __m128i & acc0,
+        __m128i & acc1) {
+    const __m128i ax = _mm_abs_epi8(xv);
+
+    acc0 = _mm_add_epi32(acc0, _mm_madd_epi16(_mm_maddubs_epi16(ax, _mm_sign_epi8(y0, xv)), scale));
+    acc1 = _mm_add_epi32(acc1, _mm_madd_epi16(_mm_maddubs_epi16(ax, _mm_sign_epi8(y1, xv)), scale));
+}
+
+static inline void iqp_acc_group_1_avx1(
+        const int8_t * GGML_RESTRICT qs,
+        __m128i                      yv,
+        __m128i                      scale_lo,
+        __m128i                      scale_hi,
+        __m128i &                    sum_lo,
+        __m128i &                    sum_hi) {
+    iqp_dot4_scaled_1_avx1(_mm_loadu_si128((const __m128i *) (qs + 0)), yv, scale_lo, sum_lo);
+    iqp_dot4_scaled_1_avx1(_mm_loadu_si128((const __m128i *) (qs + 16)), yv, scale_hi, sum_hi);
+}
+
+static inline void iqp_acc_group_2_avx1(
+        const int8_t * GGML_RESTRICT qs,
+        __m128i                      y0,
+        __m128i                      y1,
+        __m128i                      scale_lo,
+        __m128i                      scale_hi,
+        __m128i &                    sum0_lo,
+        __m128i &                    sum0_hi,
+        __m128i &                    sum1_lo,
+        __m128i &                    sum1_hi) {
+    iqp_dot4_scaled_2_avx1(_mm_loadu_si128((const __m128i *) (qs + 0)), y0, y1, scale_lo, sum0_lo, sum1_lo);
+    iqp_dot4_scaled_2_avx1(_mm_loadu_si128((const __m128i *) (qs + 16)), y0, y1, scale_hi, sum0_hi, sum1_hi);
+}
+
+static inline iqp_i32x8_avx1 iqp_acc_block_avx1(
+        const block_iqp_x8 * GGML_RESTRICT b,
+        const block_q8_K * GGML_RESTRICT   a) {
+    __m128i sum_lo = _mm_setzero_si128();
+    __m128i sum_hi = _mm_setzero_si128();
+
+    for (int sb = 0; sb < IQP_NSB; ++sb) {
+        const __m128i scales8  = _mm_loadl_epi64((const __m128i *) (b->iscales + sb * IQP_NB_ROWS));
+        const __m128i scales16 = _mm_cvtepi8_epi16(scales8);
+        const __m128i scale_lo = _mm_unpacklo_epi16(scales16, scales16);
+        const __m128i scale_hi = _mm_unpackhi_epi16(scales16, scales16);
+        const __m128i yv       = _mm_loadu_si128((const __m128i *) (a->qs + sb * IQP_SB_SIZE));
+        const int8_t * qs      = b->qs + sb * 128;
+
+        iqp_acc_group_1_avx1(qs + 0,  _mm_shuffle_epi32(yv, 0x00), scale_lo, scale_hi, sum_lo, sum_hi);
+        iqp_acc_group_1_avx1(qs + 32, _mm_shuffle_epi32(yv, 0x55), scale_lo, scale_hi, sum_lo, sum_hi);
+        iqp_acc_group_1_avx1(qs + 64, _mm_shuffle_epi32(yv, 0xaa), scale_lo, scale_hi, sum_lo, sum_hi);
+        iqp_acc_group_1_avx1(qs + 96, _mm_shuffle_epi32(yv, 0xff), scale_lo, scale_hi, sum_lo, sum_hi);
+    }
+
+    return { sum_lo, sum_hi };
+}
+
+static inline void iqp_acc_block_2_avx1(
+        const block_iqp_x8 * GGML_RESTRICT b,
+        const block_q8_K * GGML_RESTRICT   a0,
+        const block_q8_K * GGML_RESTRICT   a1,
+        iqp_i32x8_avx1 &                    result0,
+        iqp_i32x8_avx1 &                    result1) {
+    __m128i sum0_lo = _mm_setzero_si128();
+    __m128i sum0_hi = _mm_setzero_si128();
+    __m128i sum1_lo = _mm_setzero_si128();
+    __m128i sum1_hi = _mm_setzero_si128();
+
+    for (int sb = 0; sb < IQP_NSB; ++sb) {
+        const __m128i scales8  = _mm_loadl_epi64((const __m128i *) (b->iscales + sb * IQP_NB_ROWS));
+        const __m128i scales16 = _mm_cvtepi8_epi16(scales8);
+        const __m128i scale_lo = _mm_unpacklo_epi16(scales16, scales16);
+        const __m128i scale_hi = _mm_unpackhi_epi16(scales16, scales16);
+        const __m128i y0       = _mm_loadu_si128((const __m128i *) (a0->qs + sb * IQP_SB_SIZE));
+        const __m128i y1       = _mm_loadu_si128((const __m128i *) (a1->qs + sb * IQP_SB_SIZE));
+        const int8_t * qs      = b->qs + sb * 128;
+
+        iqp_acc_group_2_avx1(qs + 0, _mm_shuffle_epi32(y0, 0x00), _mm_shuffle_epi32(y1, 0x00), scale_lo,
+                             scale_hi, sum0_lo, sum0_hi, sum1_lo, sum1_hi);
+        iqp_acc_group_2_avx1(qs + 32, _mm_shuffle_epi32(y0, 0x55), _mm_shuffle_epi32(y1, 0x55), scale_lo,
+                             scale_hi, sum0_lo, sum0_hi, sum1_lo, sum1_hi);
+        iqp_acc_group_2_avx1(qs + 64, _mm_shuffle_epi32(y0, 0xaa), _mm_shuffle_epi32(y1, 0xaa), scale_lo,
+                             scale_hi, sum0_lo, sum0_hi, sum1_lo, sum1_hi);
+        iqp_acc_group_2_avx1(qs + 96, _mm_shuffle_epi32(y0, 0xff), _mm_shuffle_epi32(y1, 0xff), scale_lo,
+                             scale_hi, sum0_lo, sum0_hi, sum1_lo, sum1_hi);
+    }
+
+    result0 = { sum0_lo, sum0_hi };
+    result1 = { sum1_lo, sum1_hi };
+}
+
+static inline void iqp_gemm_tile_2_avx1(
+        int                                nb,
+        float * GGML_RESTRICT              s,
+        size_t                             bs,
+        const block_iqp_x8 * GGML_RESTRICT b_ptr_start,
+        const block_q8_K * GGML_RESTRICT   a0,
+        const block_q8_K * GGML_RESTRICT   a1,
+        int                                nc) {
+    const int ncols_interleaved = IQP_NB_ROWS;
+
+    for (int x = 0; x < nc / ncols_interleaved; ++x) {
+        const block_iqp_x8 * b_ptr = b_ptr_start + x * nb;
+        __m256 sumf0 = _mm256_setzero_ps();
+        __m256 sumf1 = _mm256_setzero_ps();
+
+        for (int l = 0; l < nb; ++l) {
+            iqp_i32x8_avx1 sumi0;
+            iqp_i32x8_avx1 sumi1;
+            iqp_acc_block_2_avx1(b_ptr + l, a0 + l, a1 + l, sumi0, sumi1);
+
+            const __m256 dfac = _mm256_loadu_ps(b_ptr[l].dfac);
+            const __m256 d0   = _mm256_mul_ps(dfac, _mm256_set1_ps(a0[l].d));
+            const __m256 d1   = _mm256_mul_ps(dfac, _mm256_set1_ps(a1[l].d));
+
+            sumf0 = _mm256_add_ps(sumf0,
+                                  _mm256_mul_ps(_mm256_cvtepi32_ps(iqp_join_i32x8_avx1(sumi0.lo, sumi0.hi)), d0));
+            sumf1 = _mm256_add_ps(sumf1,
+                                  _mm256_mul_ps(_mm256_cvtepi32_ps(iqp_join_i32x8_avx1(sumi1.lo, sumi1.hi)), d1));
+        }
+
+        _mm256_storeu_ps(s + 0 * bs + x * ncols_interleaved, sumf0);
+        _mm256_storeu_ps(s + 1 * bs + x * ncols_interleaved, sumf1);
+    }
+}
+
+static inline void iqp_gemm_tile_4_avx1(
+        int                                nb,
+        float * GGML_RESTRICT              s,
+        size_t                             bs,
+        const block_iqp_x8 * GGML_RESTRICT b_ptr_start,
+        const block_q8_K * const           a_ptr[4],
+        int                                nc) {
+    // Two activation rows keep the integer working set below the 16-register limit of Ivy Bridge.
+    iqp_gemm_tile_2_avx1(nb, s + 0 * bs, bs, b_ptr_start, a_ptr[0], a_ptr[1], nc);
+    iqp_gemm_tile_2_avx1(nb, s + 2 * bs, bs, b_ptr_start, a_ptr[2], a_ptr[3], nc);
+}
+
+#endif  // defined(__AVX__) && !defined(__AVX2__)
+
 static void iqp_gemv_8x8_q8_K(int                        n,
                               float * GGML_RESTRICT      s,
                               size_t                     bs,
@@ -962,6 +1229,26 @@ static void iqp_gemv_8x8_q8_K(int                        n,
             const __m256 dv = _mm256_mul_ps(_mm256_loadu_ps(b_ptr[l].dfac), _mm256_set1_ps(a_ptr[l].d));
 
             sumf = _mm256_fmadd_ps(_mm256_cvtepi32_ps(iqp_acc_block(b_ptr + l, a_ptr + l)), dv, sumf);
+        }
+
+        _mm256_storeu_ps(s + x * ncols_interleaved, sumf);
+    }
+
+    return;
+#elif defined(__AVX__)
+    const block_iqp_x8 * b_ptr_start = (const block_iqp_x8 *) vx;
+    const block_q8_K *   a_ptr       = (const block_q8_K *) vy;
+
+    for (int x = 0; x < nc / ncols_interleaved; ++x) {
+        const block_iqp_x8 * b_ptr = b_ptr_start + x * nb;
+        __m256 sumf = _mm256_setzero_ps();
+
+        for (int l = 0; l < nb; ++l) {
+            const iqp_i32x8_avx1 sumi = iqp_acc_block_avx1(b_ptr + l, a_ptr + l);
+            const __m256 dv = _mm256_mul_ps(_mm256_loadu_ps(b_ptr[l].dfac), _mm256_set1_ps(a_ptr[l].d));
+
+            sumf = _mm256_add_ps(
+                sumf, _mm256_mul_ps(_mm256_cvtepi32_ps(iqp_join_i32x8_avx1(sumi.lo, sumi.hi)), dv));
         }
 
         _mm256_storeu_ps(s + x * ncols_interleaved, sumf);
@@ -1004,6 +1291,20 @@ static void iqp_gemm_8x8_q8_K(int                        n,
     }
 
     return;
+#elif defined(__AVX__)
+    const block_iqp_x8 * b_ptr_start = (const block_iqp_x8 *) vx;
+    const block_q8_K *   a_ptr_start = (const block_q8_K *) vy;
+
+    for (int y = 0; y < nr / 4; ++y) {
+        const block_q8_K * a_ptr[4];
+        for (int m = 0; m < 4; ++m) {
+            a_ptr[m] = a_ptr_start + (y * 4 + m) * nb;
+        }
+
+        iqp_gemm_tile_4_avx1(nb, s + y * 4 * bs, bs, b_ptr_start, a_ptr, nc);
+    }
+
+    return;
 #endif
 
     iqp_gemm_8x8_q8_K_generic(n, s, bs, vx, vy, nr, nc);
@@ -1032,6 +1333,15 @@ static void iqp_gemm_8x8_q8_K_p4(int                                n,
     }
 
     iqp_gemm_tile_4(nb, s, bs, (const block_iqp_x8 *) vx, a_ptr, nc);
+
+    return;
+#elif defined(__AVX__)
+    const block_q8_K * a_ptr[4];
+    for (int m = 0; m < 4; ++m) {
+        a_ptr[m] = (const block_q8_K *) vy[m];
+    }
+
+    iqp_gemm_tile_4_avx1(nb, s, bs, (const block_iqp_x8 *) vx, a_ptr, nc);
 
     return;
 #endif
@@ -1069,9 +1379,18 @@ static bool iqp_supported_common(const struct ggml_tensor * dst) {
         return false;
     }
 
+#if defined(__AVX2__)
     if (!ggml_cpu_has_avx2()) {
         return false;
     }
+#elif defined(__AVX__)
+    // The AVX1 panel kernel currently covers IQ4_XS only. Other IQ formats keep their compact vec_dot paths.
+    if (src0->type != GGML_TYPE_IQ4_XS || !ggml_cpu_has_avx()) {
+        return false;
+    }
+#else
+    return false;
+#endif
 
     if (src1->type != GGML_TYPE_F32) {
         return false;
