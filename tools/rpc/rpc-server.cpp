@@ -1,4 +1,5 @@
 #include "ggml-rpc.h"
+#include "ggml-cpu.h"
 #ifdef _WIN32
 #  define NOMINMAX
 #  define DIRECTORY_SEPARATOR '\\'
@@ -173,6 +174,7 @@ struct rpc_server_params {
     std::string              host        = "127.0.0.1";
     int                      port        = 50052;
     bool                     use_cache   = false;
+    bool                     numa_split = false;
     int                      n_threads   = std::max(1U, std::thread::hardware_concurrency()/2);
     std::vector<std::string> devices;
 };
@@ -183,6 +185,7 @@ static void print_usage(int /*argc*/, char ** argv, rpc_server_params params) {
     fprintf(stderr, "  -h, --help                       show this help message and exit\n");
     fprintf(stderr, "  -t, --threads N                  number of threads for the CPU device (default: %d)\n", params.n_threads);
     fprintf(stderr, "  -d, --device <dev1,dev2,...>     comma-separated list of devices\n");
+    fprintf(stderr, "      --numa split                 expose each NUMA node as a CPU device\n");
     fprintf(stderr, "  -H, --host HOST                  host to bind to (default: %s)\n", params.host.c_str());
     fprintf(stderr, "  -p, --port PORT                  port to bind to (default: %d)\n", params.port);
     fprintf(stderr, "  -c, --cache                      enable local file cache\n");
@@ -223,6 +226,12 @@ static bool rpc_server_params_parse(int argc, char ** argv, rpc_server_params & 
                     return false;
                 }
             }
+        } else if (arg == "--numa") {
+            if (++i >= argc || std::string(argv[i]) != "split") {
+                fprintf(stderr, "error: RPC server supports only '--numa split'\n");
+                return false;
+            }
+            params.numa_split = true;
         } else if (arg == "-p" || arg == "--port") {
             if (++i >= argc) {
                 return false;
@@ -243,6 +252,41 @@ static bool rpc_server_params_parse(int argc, char ** argv, rpc_server_params & 
         }
     }
     return true;
+}
+
+static int get_device_numa_node(ggml_backend_dev_t dev) {
+    ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    if (reg == nullptr) {
+        return -1;
+    }
+
+    auto * fn = (ggml_backend_dev_get_numa_node_t)
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_numa_node");
+    return fn ? fn(dev) : -1;
+}
+
+static enum ggml_numa_split_status init_numa_split() {
+    ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    if (cpu_dev == nullptr) {
+        fprintf(stderr, "error: CPU backend is not available for --numa split\n");
+        return GGML_NUMA_SPLIT_STATUS_FAILED;
+    }
+
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(cpu_dev);
+    auto split_init_fn = (ggml_backend_cpu_numa_split_init_t)
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_numa_split_init");
+    if (split_init_fn == nullptr) {
+        fprintf(stderr, "error: CPU backend does not support --numa split\n");
+        return GGML_NUMA_SPLIT_STATUS_UNAVAILABLE;
+    }
+
+    ggml_backend_dev_t node_devs[GGML_CPU_NUMA_SPLIT_MAX_DEVICES];
+    size_t n_node_devs = sizeof(node_devs)/sizeof(node_devs[0]);
+    const enum ggml_numa_split_status status = split_init_fn(node_devs, &n_node_devs);
+    for (size_t i = 0; i < n_node_devs; i++) {
+        ggml_backend_device_register(node_devs[i]);
+    }
+    return status;
 }
 
 static std::vector<ggml_backend_dev_t> get_devices(const rpc_server_params & params) {
@@ -276,6 +320,16 @@ static std::vector<ggml_backend_dev_t> get_devices(const rpc_server_params & par
         }
     }
 
+    // With --numa split, make each CPU node available when devices were not selected explicitly.
+    if (params.devices.empty() && params.numa_split) {
+        for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+            if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU && get_device_numa_node(dev) >= 0) {
+                devices.push_back(dev);
+            }
+        }
+    }
+
     // If there are no accelerators, fallback to CPU device
     if (devices.empty()) {
         ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
@@ -296,6 +350,13 @@ int main(int argc, char * argv[]) {
     if (!rpc_server_params_parse(argc, argv, params)) {
         fprintf(stderr, "Invalid parameters\n");
         return 1;
+    }
+
+    if (params.numa_split) {
+        const enum ggml_numa_split_status status = init_numa_split();
+        if (status == GGML_NUMA_SPLIT_STATUS_FAILED) {
+            return 1;
+        }
     }
 
     if (params.host != "127.0.0.1") {
