@@ -936,9 +936,23 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1(
     v[0] = q4[0];
     v[1] = q4[4];
 
-    const uint16_t * scales = (const uint16_t *)bq4_K->scales;
     uint16_t aux[2];
     const int j = bq8_offset/2;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_TURING
+    const uint32_t * scales = (const uint32_t *)bq4_K->scales;
+    const int shift = 16 * (j & 1);
+    const uint16_t scale0 = scales[0] >> shift;
+    const uint16_t scale1 = scales[1] >> shift;
+    const uint16_t scale2 = scales[2] >> shift;
+    if (j < 2) {
+        aux[0] = scale0 & 0x3f3f;
+        aux[1] = scale1 & 0x3f3f;
+    } else {
+        aux[0] = ((scale2 >> 0) & 0x0f0f) | ((scale0 & 0xc0c0) >> 2);
+        aux[1] = ((scale2 >> 4) & 0x0f0f) | ((scale1 & 0xc0c0) >> 2);
+    }
+#else
+    const uint16_t * scales = (const uint16_t *)bq4_K->scales;
     if (j < 2) {
         aux[0] = scales[j+0] & 0x3f3f;
         aux[1] = scales[j+2] & 0x3f3f;
@@ -946,6 +960,7 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1(
         aux[0] = ((scales[j+2] >> 0) & 0x0f0f) | ((scales[j-2] & 0xc0c0) >> 2);
         aux[1] = ((scales[j+2] >> 4) & 0x0f0f) | ((scales[j-0] & 0xc0c0) >> 2);
     }
+#endif
     const uint8_t * sc = (const uint8_t *)aux;
     const uint8_t * m  = sc + 2;
 
@@ -981,9 +996,23 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1(
     vh[0] = qh[0] >> bq8_offset;
     vh[1] = qh[4] >> bq8_offset;
 
-    const uint16_t * scales = (const uint16_t *)bq5_K->scales;
     uint16_t aux[2];
     const int j = bq8_offset/2;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_TURING
+    const uint32_t * scales = (const uint32_t *)bq5_K->scales;
+    const int shift = 16 * (j & 1);
+    const uint16_t scale0 = scales[0] >> shift;
+    const uint16_t scale1 = scales[1] >> shift;
+    const uint16_t scale2 = scales[2] >> shift;
+    if (j < 2) {
+        aux[0] = scale0 & 0x3f3f;
+        aux[1] = scale1 & 0x3f3f;
+    } else {
+        aux[0] = ((scale2 >> 0) & 0x0f0f) | ((scale0 & 0xc0c0) >> 2);
+        aux[1] = ((scale2 >> 4) & 0x0f0f) | ((scale1 & 0xc0c0) >> 2);
+    }
+#else
+    const uint16_t * scales = (const uint16_t *)bq5_K->scales;
     if (j < 2) {
         aux[0] = scales[j+0] & 0x3f3f;
         aux[1] = scales[j+2] & 0x3f3f;
@@ -991,6 +1020,7 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1(
         aux[0] = ((scales[j+2] >> 0) & 0x0f0f) | ((scales[j-2] & 0xc0c0) >> 2);
         aux[1] = ((scales[j+2] >> 4) & 0x0f0f) | ((scales[j-0] & 0xc0c0) >> 2);
     }
+#endif
     const uint8_t * sc = (const uint8_t *)aux;
     const uint8_t * m  = sc + 2;
 
