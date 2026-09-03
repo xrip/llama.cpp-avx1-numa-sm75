@@ -624,7 +624,6 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1_impl_mmq(
 #define VDR_Q6_K_Q8_1_MMQ  8
 
 // contiguous v/x values
-template <bool use_nonsaturating_subtract>
 static __device__ __forceinline__ float vec_dot_q6_K_q8_1_impl_mmvq(
     const int & vl, const int & vh, const int * __restrict__ u, const int8_t * __restrict__ scales,
     const float & d, const float * __restrict__ d8) {
@@ -639,14 +638,8 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1_impl_mmvq(
 
         const int vih = ((vh >> (4*i)) << 4) & 0x30303030;
 
-        int dot;
-        if constexpr (use_nonsaturating_subtract) {
-            const int vi = vil | vih;
-            dot = ggml_cuda_dp4a(vi, u[i], ggml_cuda_dp4a(0xE0E0E0E0, u[i], 0));
-        } else {
-            const int vi = __vsubss4((vil | vih), 0x20202020); // vi = (vil | vih) - 32
-            dot = ggml_cuda_dp4a(vi, u[i], 0);
-        }
+        const int vi = vil | vih;
+        const int dot = ggml_cuda_dp4a(vi, u[i], ggml_cuda_dp4a(0xE0E0E0E0, u[i], 0));
 
         sumf += d8[i] * (dot * sc); // SIMD dot product
     }
@@ -1045,7 +1038,6 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1(
     return vec_dot_q5_K_q8_1_impl_vmmq(vl, vh, u, sc, m, bq5_K->dm, d8);
 }
 
-template <bool use_nonsaturating_subtract>
 static __device__ __forceinline__ float vec_dot_q6_K_q8_1(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
 
@@ -1069,7 +1061,7 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1(
         d8[i] = __low2float(bq8_1[bq8_offset + 2*i].ds);
     }
 
-    return vec_dot_q6_K_q8_1_impl_mmvq<use_nonsaturating_subtract>(vl, vh, u, scales, bq6_K->d, d8);
+    return vec_dot_q6_K_q8_1_impl_mmvq(vl, vh, u, scales, bq6_K->d, d8);
 }
 
 #define VDR_IQ2_XXS_Q8_1_MMVQ 2
