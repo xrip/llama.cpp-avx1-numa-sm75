@@ -1406,9 +1406,15 @@ static __device__ __forceinline__ float vec_dot_iq4_xs_q8_1(
         sumi = ggml_cuda_dp4a(v.y, u1, sumi);
     }
 
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_TURING
+    const uint2 header = *(const uint2 *) bq4;
+    const int ls = ((header.y >> iqs) & 0x0F) | (((header.x >> (16 + iqs/2)) & 0x03) << 4);
+    const float d = __half2float(__ushort_as_half((uint16_t) header.x)) * __low2float(bq8_1[iqs/4].ds);
+#else
     const int ls = ((bq4->scales_l[iqs/8] >> (iqs & 0x04)) & 0x0F) | (((bq4->scales_h >> (iqs/2)) & 0x03) << 4);
+    const float d = __half2float(bq4->d) * __low2float(bq8_1[iqs/4].ds);
+#endif
     sumi *= ls - 32;
 
-    const float d = __half2float(bq4->d) * __low2float(bq8_1[iqs/4].ds);
     return d * sumi;
 }
