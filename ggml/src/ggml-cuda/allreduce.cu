@@ -73,7 +73,7 @@ static constexpr size_t GGML_CUDA_AR_ARRIVAL_STRIDE = 64;
 // Number of blocks the chunked kernel launches with.  Each block stripes a
 // disjoint slice of the data and synchronizes through its own arrival-token
 // slot so multiple SMs can pump PCIe stores in parallel.
-static constexpr int GGML_CUDA_AR_KERNEL_BLOCKS = 4;
+static constexpr int GGML_CUDA_AR_KERNEL_BLOCKS = 8;
 
 // ---------------------------------------------------------------------------
 // Chunked kernel AllReduce -- 2 GPUs, supports float, half, and bfloat16.
