@@ -1350,10 +1350,23 @@ static __device__ __forceinline__ float vec_dot_iq4_xs_q8_1(
 
     const block_iq4_xs * bq4 = (const block_iq4_xs *) vbq + kbx;
 
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_TURING
+    // IQ4_XS qs starts at an 8-byte aligned offset and iqs is a multiple of four.
+    // Load the four adjacent words in two operations on Turing.
+    const int2 * q4_packed = (const int2 *) (bq4->qs + sizeof(int)*iqs);
+    const int2   q4_01     = q4_packed[0];
+    const int2   q4_23     = q4_packed[1];
+    const int    q4[4]     = {q4_01.x, q4_01.y, q4_23.x, q4_23.y};
+#endif
+
     int sumi = 0;
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_TURING
+        const int aux_q4 = q4[j];
+#else
         const int aux_q4 = get_int_b4(bq4->qs, iqs + j);
+#endif
         const int2 v = get_int_from_table_16(aux_q4, kvalues_iq4nl);
 
         const int u0 = get_int_b4(bq8_1[iqs/4].qs, j + 0);
