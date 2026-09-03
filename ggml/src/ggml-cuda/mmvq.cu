@@ -8,7 +8,7 @@
 
 typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs);
 
-static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) {
+static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type, bool q6_nonsaturating = false) {
     switch (type) {
         case GGML_TYPE_Q1_0:    return vec_dot_q1_0_q8_1;
         case GGML_TYPE_Q2_0:    return vec_dot_q2_0_q8_1;
@@ -23,7 +23,8 @@ static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) 
         case GGML_TYPE_Q3_K:    return vec_dot_q3_K_q8_1;
         case GGML_TYPE_Q4_K:    return vec_dot_q4_K_q8_1;
         case GGML_TYPE_Q5_K:    return vec_dot_q5_K_q8_1;
-        case GGML_TYPE_Q6_K:    return vec_dot_q6_K_q8_1;
+        case GGML_TYPE_Q6_K:
+            return q6_nonsaturating ? vec_dot_q6_K_q8_1<true> : vec_dot_q6_K_q8_1<false>;
         case GGML_TYPE_IQ2_XXS: return vec_dot_iq2_xxs_q8_1;
         case GGML_TYPE_IQ2_XS:  return vec_dot_iq2_xs_q8_1;
         case GGML_TYPE_IQ2_S:   return vec_dot_iq2_s_q8_1;
@@ -563,7 +564,8 @@ static __global__ void mul_mat_vec_q(
     constexpr int rows_per_cuda_block = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
-    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
+    constexpr bool q6_nonsaturating = table_id == MMVQ_PARAMETERS_TURING && ncols_dst == 1;
+    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type, q6_nonsaturating);
 
     const     int tid = warp_size*threadIdx.y + threadIdx.x;
     const     int row0 = rows_per_cuda_block*blockIdx.x;
