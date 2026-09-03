@@ -1018,6 +1018,8 @@ struct ggml_backend_cuda_comm_context {
     }
 };
 
+static constexpr size_t GGML_CUDA_AR_HYBRID_THRESHOLD = 1024 * 1024;
+
 #ifdef GGML_USE_NCCL
 // AllReduce via NCCL. Reduces as FP32 for small tensors and BF16 for large
 // tensors (bandwidth-bound), then converts back to FP32.
@@ -1162,6 +1164,20 @@ static bool ggml_backend_cuda_comm_try_allreduce_internal(
     return ggml_backend_cuda_comm_allreduce_internal(comm_ctx, tensors);
 }
 
+#ifdef GGML_USE_NCCL
+static bool ggml_backend_cuda_comm_try_allreduce_hybrid(
+        ggml_backend_cuda_comm_context * comm_ctx, struct ggml_tensor ** tensors) {
+    GGML_ASSERT(tensors[0] != nullptr);
+
+    if (ggml_nbytes(tensors[0]) < GGML_CUDA_AR_HYBRID_THRESHOLD &&
+            ggml_backend_cuda_comm_allreduce_internal(comm_ctx, tensors)) {
+        return true;
+    }
+
+    return ggml_backend_cuda_comm_allreduce_nccl(comm_ctx, tensors);
+}
+#endif // GGML_USE_NCCL
+
 static bool ggml_backend_cuda_comm_try_allreduce_butterfly(
         ggml_backend_cuda_comm_context *, struct ggml_tensor **) {
     return false;
@@ -1228,7 +1244,29 @@ static void ggml_backend_cuda_comm_init_nccl(ggml_backend_cuda_comm_context * re
     ggml_backend_cuda_comm_init_internal(ret);
 }
 
-// Top-level init.  Picks one of the three init paths based on
+static void ggml_backend_cuda_comm_init_hybrid(ggml_backend_cuda_comm_context * ret) {
+#ifdef GGML_USE_NCCL
+    ggml_backend_cuda_comm_init_nccl(ret);
+    if (ret->try_allreduce != ggml_backend_cuda_comm_try_allreduce_nccl) {
+        return;
+    }
+
+    ret->ar_pipeline = ggml_cuda_ar_pipeline_init(ret->dev_ids.data(), ret->dev_ids.size());
+    if (ret->ar_pipeline == nullptr) {
+        (void) cudaGetLastError();
+        GGML_LOG_WARN("internal AllReduce init failed; using NCCL instead of hybrid AllReduce\n");
+        return;
+    }
+
+    ret->try_allreduce = ggml_backend_cuda_comm_try_allreduce_hybrid;
+    GGML_LOG_INFO("using hybrid AllReduce: internal below %zu bytes, NCCL otherwise\n",
+                  GGML_CUDA_AR_HYBRID_THRESHOLD);
+#else
+    ggml_backend_cuda_comm_init_internal(ret);
+#endif // GGML_USE_NCCL
+}
+
+// Top-level init.  Picks one of the init paths based on
 // GGML_CUDA_ALLREDUCE (or the platform default) and lets the chain handle
 // any fallback.  Unrecognised env values warn and fall through to the
 // platform default.
@@ -1260,6 +1298,8 @@ static void * ggml_backend_cuda_comm_init(ggml_backend_t * backends, size_t n_ba
             ggml_backend_cuda_comm_init_nccl(ret);
         } else if (env_str == "internal") {
             ggml_backend_cuda_comm_init_internal(ret);
+        } else if (env_str == "hybrid") {
+            ggml_backend_cuda_comm_init_hybrid(ret);
         } else if (env_str == "none") {
             ggml_backend_cuda_comm_init_none(ret);
         } else {
