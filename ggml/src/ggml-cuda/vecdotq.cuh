@@ -936,9 +936,23 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1(
     v[0] = q4[0];
     v[1] = q4[4];
 
-    const uint16_t * scales = (const uint16_t *)bq4_K->scales;
     uint16_t aux[2];
     const int j = bq8_offset/2;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_TURING
+    const uint32_t * scales = (const uint32_t *)bq4_K->scales;
+    const int shift = 16 * (j & 1);
+    const uint16_t scale0 = scales[0] >> shift;
+    const uint16_t scale1 = scales[1] >> shift;
+    const uint16_t scale2 = scales[2] >> shift;
+    if (j < 2) {
+        aux[0] = scale0 & 0x3f3f;
+        aux[1] = scale1 & 0x3f3f;
+    } else {
+        aux[0] = ((scale2 >> 0) & 0x0f0f) | ((scale0 & 0xc0c0) >> 2);
+        aux[1] = ((scale2 >> 4) & 0x0f0f) | ((scale1 & 0xc0c0) >> 2);
+    }
+#else
+    const uint16_t * scales = (const uint16_t *)bq4_K->scales;
     if (j < 2) {
         aux[0] = scales[j+0] & 0x3f3f;
         aux[1] = scales[j+2] & 0x3f3f;
@@ -946,6 +960,7 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1(
         aux[0] = ((scales[j+2] >> 0) & 0x0f0f) | ((scales[j-2] & 0xc0c0) >> 2);
         aux[1] = ((scales[j+2] >> 4) & 0x0f0f) | ((scales[j-0] & 0xc0c0) >> 2);
     }
+#endif
     const uint8_t * sc = (const uint8_t *)aux;
     const uint8_t * m  = sc + 2;
 
@@ -981,9 +996,23 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1(
     vh[0] = qh[0] >> bq8_offset;
     vh[1] = qh[4] >> bq8_offset;
 
-    const uint16_t * scales = (const uint16_t *)bq5_K->scales;
     uint16_t aux[2];
     const int j = bq8_offset/2;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_TURING
+    const uint32_t * scales = (const uint32_t *)bq5_K->scales;
+    const int shift = 16 * (j & 1);
+    const uint16_t scale0 = scales[0] >> shift;
+    const uint16_t scale1 = scales[1] >> shift;
+    const uint16_t scale2 = scales[2] >> shift;
+    if (j < 2) {
+        aux[0] = scale0 & 0x3f3f;
+        aux[1] = scale1 & 0x3f3f;
+    } else {
+        aux[0] = ((scale2 >> 0) & 0x0f0f) | ((scale0 & 0xc0c0) >> 2);
+        aux[1] = ((scale2 >> 4) & 0x0f0f) | ((scale1 & 0xc0c0) >> 2);
+    }
+#else
+    const uint16_t * scales = (const uint16_t *)bq5_K->scales;
     if (j < 2) {
         aux[0] = scales[j+0] & 0x3f3f;
         aux[1] = scales[j+2] & 0x3f3f;
@@ -991,6 +1020,7 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1(
         aux[0] = ((scales[j+2] >> 0) & 0x0f0f) | ((scales[j-2] & 0xc0c0) >> 2);
         aux[1] = ((scales[j+2] >> 4) & 0x0f0f) | ((scales[j-0] & 0xc0c0) >> 2);
     }
+#endif
     const uint8_t * sc = (const uint8_t *)aux;
     const uint8_t * m  = sc + 2;
 
@@ -1350,10 +1380,23 @@ static __device__ __forceinline__ float vec_dot_iq4_xs_q8_1(
 
     const block_iq4_xs * bq4 = (const block_iq4_xs *) vbq + kbx;
 
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_TURING
+    // IQ4_XS qs starts at an 8-byte aligned offset and iqs is a multiple of four.
+    // Load the four adjacent words in two operations on Turing.
+    const int2 * q4_packed = (const int2 *) (bq4->qs + sizeof(int)*iqs);
+    const int2   q4_01     = q4_packed[0];
+    const int2   q4_23     = q4_packed[1];
+    const int    q4[4]     = {q4_01.x, q4_01.y, q4_23.x, q4_23.y};
+#endif
+
     int sumi = 0;
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_TURING
+        const int aux_q4 = q4[j];
+#else
         const int aux_q4 = get_int_b4(bq4->qs, iqs + j);
+#endif
         const int2 v = get_int_from_table_16(aux_q4, kvalues_iq4nl);
 
         const int u0 = get_int_b4(bq8_1[iqs/4].qs, j + 0);
@@ -1363,9 +1406,15 @@ static __device__ __forceinline__ float vec_dot_iq4_xs_q8_1(
         sumi = ggml_cuda_dp4a(v.y, u1, sumi);
     }
 
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_TURING
+    const uint2 header = *(const uint2 *) bq4;
+    const int ls = ((header.y >> iqs) & 0x0F) | (((header.x >> (16 + iqs/2)) & 0x03) << 4);
+    const float d = __half2float(__ushort_as_half((uint16_t) header.x)) * __low2float(bq8_1[iqs/4].ds);
+#else
     const int ls = ((bq4->scales_l[iqs/8] >> (iqs & 0x04)) & 0x0F) | (((bq4->scales_h >> (iqs/2)) & 0x03) << 4);
+    const float d = __half2float(bq4->d) * __low2float(bq8_1[iqs/4].ds);
+#endif
     sumi *= ls - 32;
 
-    const float d = __half2float(bq4->d) * __low2float(bq8_1[iqs/4].ds);
     return d * sumi;
 }
