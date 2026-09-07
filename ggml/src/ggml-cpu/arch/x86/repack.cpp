@@ -8,6 +8,7 @@
 #include "ggml-cpu-impl.h"
 #include "simd-mappings.h"
 #include "traits.h"
+#include "../../avx1-panel-utils.h"
 
 #include <cmath>
 #include <cstring>
@@ -319,6 +320,9 @@ void ggml_quantize_mat_q8_K_4x4(
             quantize_q8_K_row_avx1(row_src, &y[ib].d[row], quantized[row]);
         }
 
+#if !defined(__AVX2__)
+        ggml_avx1_pack_q8kx4(y[ib].qs, y[ib].bsums, quantized);
+#else
         memset(y[ib].bsums, 0, sizeof(y[ib].bsums));
 
         // Preserve the generic Q8_Kx4 layout exactly. Keeping this layout loop
@@ -333,6 +337,7 @@ void ggml_quantize_mat_q8_K_4x4(
             y[ib].qs[j] = value;
             y[ib].bsums[index] += value;
         }
+#endif
     }
     return;
 #endif
