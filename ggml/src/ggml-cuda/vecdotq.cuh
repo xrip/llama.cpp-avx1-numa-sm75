@@ -993,31 +993,32 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1(
     v[0] = q4[0];
     v[1] = q4[4];
 
-    uint16_t aux[2];
-    const int j = bq8_offset/2;
+    const int j  = bq8_offset/2;
+    const int jm = j & 1;
+
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_TURING
+    // Turing: three 32-bit loads of the 12-byte scales array beat three 16-bit ones,
+    // the wanted halves are shifted out afterwards.
     const uint32_t * scales = (const uint32_t *)bq4_K->scales;
-    const int shift = 16 * (j & 1);
-    const uint16_t scale0 = scales[0] >> shift;
-    const uint16_t scale1 = scales[1] >> shift;
-    const uint16_t scale2 = scales[2] >> shift;
-    if (j < 2) {
-        aux[0] = scale0 & 0x3f3f;
-        aux[1] = scale1 & 0x3f3f;
-    } else {
-        aux[0] = ((scale2 >> 0) & 0x0f0f) | ((scale0 & 0xc0c0) >> 2);
-        aux[1] = ((scale2 >> 4) & 0x0f0f) | ((scale1 & 0xc0c0) >> 2);
-    }
+    const int shift = 16 * jm;
+
+    const uint32_t s0 = (uint16_t) (scales[0] >> shift);
+    const uint32_t s2 = (uint16_t) (scales[1] >> shift);
+    const uint32_t s4 = (uint16_t) (scales[2] >> shift);
 #else
     const uint16_t * scales = (const uint16_t *)bq4_K->scales;
-    if (j < 2) {
-        aux[0] = scales[j+0] & 0x3f3f;
-        aux[1] = scales[j+2] & 0x3f3f;
-    } else {
-        aux[0] = ((scales[j+2] >> 0) & 0x0f0f) | ((scales[j-2] & 0xc0c0) >> 2);
-        aux[1] = ((scales[j+2] >> 4) & 0x0f0f) | ((scales[j-0] & 0xc0c0) >> 2);
-    }
+
+    const uint32_t s0 = scales[jm + 0];
+    const uint32_t s2 = scales[jm + 2];
+    const uint32_t s4 = scales[jm + 4];
 #endif
+
+    // branchless so nvcc can hoist this out of the ncols_dst loop
+    const uint32_t hi = (uint32_t) -(int32_t) (j >= 2);
+
+    uint16_t aux[2];
+    aux[0] = (uint16_t) (((s0 & 0x3f3f) & ~hi) | ((((s4 >> 0) & 0x0f0f) | ((s0 & 0xc0c0) >> 2)) & hi));
+    aux[1] = (uint16_t) (((s2 & 0x3f3f) & ~hi) | ((((s4 >> 4) & 0x0f0f) | ((s2 & 0xc0c0) >> 2)) & hi));
     const uint8_t * sc = (const uint8_t *)aux;
     const uint8_t * m  = sc + 2;
 
@@ -1053,31 +1054,30 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1(
     vh[0] = qh[0] >> bq8_offset;
     vh[1] = qh[4] >> bq8_offset;
 
-    uint16_t aux[2];
-    const int j = bq8_offset/2;
+    // same as q4_K
+    const int j  = bq8_offset/2;
+    const int jm = j & 1;
+
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_TURING
     const uint32_t * scales = (const uint32_t *)bq5_K->scales;
-    const int shift = 16 * (j & 1);
-    const uint16_t scale0 = scales[0] >> shift;
-    const uint16_t scale1 = scales[1] >> shift;
-    const uint16_t scale2 = scales[2] >> shift;
-    if (j < 2) {
-        aux[0] = scale0 & 0x3f3f;
-        aux[1] = scale1 & 0x3f3f;
-    } else {
-        aux[0] = ((scale2 >> 0) & 0x0f0f) | ((scale0 & 0xc0c0) >> 2);
-        aux[1] = ((scale2 >> 4) & 0x0f0f) | ((scale1 & 0xc0c0) >> 2);
-    }
+    const int shift = 16 * jm;
+
+    const uint32_t s0 = (uint16_t) (scales[0] >> shift);
+    const uint32_t s2 = (uint16_t) (scales[1] >> shift);
+    const uint32_t s4 = (uint16_t) (scales[2] >> shift);
 #else
     const uint16_t * scales = (const uint16_t *)bq5_K->scales;
-    if (j < 2) {
-        aux[0] = scales[j+0] & 0x3f3f;
-        aux[1] = scales[j+2] & 0x3f3f;
-    } else {
-        aux[0] = ((scales[j+2] >> 0) & 0x0f0f) | ((scales[j-2] & 0xc0c0) >> 2);
-        aux[1] = ((scales[j+2] >> 4) & 0x0f0f) | ((scales[j-0] & 0xc0c0) >> 2);
-    }
+
+    const uint32_t s0 = scales[jm + 0];
+    const uint32_t s2 = scales[jm + 2];
+    const uint32_t s4 = scales[jm + 4];
 #endif
+
+    const uint32_t hi = (uint32_t) -(int32_t) (j >= 2);
+
+    uint16_t aux[2];
+    aux[0] = (uint16_t) (((s0 & 0x3f3f) & ~hi) | ((((s4 >> 0) & 0x0f0f) | ((s0 & 0xc0c0) >> 2)) & hi));
+    aux[1] = (uint16_t) (((s2 & 0x3f3f) & ~hi) | ((((s4 >> 4) & 0x0f0f) | ((s2 & 0xc0c0) >> 2)) & hi));
     const uint8_t * sc = (const uint8_t *)aux;
     const uint8_t * m  = sc + 2;
 

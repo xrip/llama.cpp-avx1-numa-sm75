@@ -2336,27 +2336,40 @@ struct test_get_rows : public test_case {
     const int r; // rows to get
     const int be1; // batch size
     const int be2; // batch size
-    const bool v; // view (non-contiguous src1)
+    const bool v; // view src1
+    const bool vs0; // view src0
 
     std::string vars() override {
-        return VARS_TO_STR7(type, n, m, r, be1, be2, v);
+        return VARS_TO_STR8(type, n, m, r, be1, be2, v, vs0);
     }
 
-    test_get_rows(ggml_type type = GGML_TYPE_F32, int n = 10, int m = 5, int r = 3, int be1 = 1, int be2 = 1, bool v = false)
-        : type(type), n(n), m(m), r(r), be1(be1), be2(be2), v(v) {}
+    test_get_rows(ggml_type type = GGML_TYPE_F32, int n = 10, int m = 5, int r = 3, int be1 = 1, int be2 = 1, bool v = false, bool vs0 = false)
+        : type(type), n(n), m(m), r(r), be1(be1), be2(be2), v(v), vs0(vs0) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * in = ggml_new_tensor_4d(ctx, type, n, m, be1, be2);
-        ggml_set_name(in, "in");
+        ggml_tensor * in;
+        if (vs0) {
+            const int offset_rows = 3;
+            const int padded_m = m + offset_rows;
+            ggml_tensor * in_padded = ggml_new_tensor_4d(ctx, type, n, padded_m, be1, be2);
+            ggml_set_name(in_padded, "in_padded");
+            in = ggml_view_4d(ctx, in_padded, n, m, be1, be2,
+                              in_padded->nb[1], in_padded->nb[2], in_padded->nb[3],
+                              offset_rows * in_padded->nb[1]);
+            ggml_set_name(in, "in_view");
+        } else {
+            in = ggml_new_tensor_4d(ctx, type, n, m, be1, be2);
+            ggml_set_name(in, "in");
+        }
 
-        ggml_tensor * rows = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, r, be1, be2);
+        ggml_tensor * rows = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, v ? r + 1 : r, be1, be2);
         ggml_set_name(rows, "rows");
         if (v) {
-            rows = ggml_view_3d(ctx, rows, r/2, be1, be2, rows->nb[1], rows->nb[2], 0);
+            rows = ggml_view_3d(ctx, rows, r/2, be1, be2, rows->nb[1], rows->nb[2], rows->nb[0]);
             ggml_set_name(rows, "view_of_rows");
         }
 
-        const bool grad_supported = ggml_is_matrix(in) && ggml_is_vector(rows);
+        const bool grad_supported = !vs0 && ggml_is_matrix(in) && ggml_is_vector(rows);
         if (grad_supported) {
             ggml_set_param(in);
             // rows is a constant input -> no gradients
@@ -2370,14 +2383,16 @@ struct test_get_rows : public test_case {
 
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) {
+                continue;
+            }
             if (t->type == GGML_TYPE_I32) {
-                if (ggml_is_view_op(t->op)) { continue; }
                 // rows
-                std::vector<int> data(r*be1*be2);
-                for (int i = 0; i < r*be1*be2; i++) {
+                std::vector<int> data(ggml_nelements(t));
+                for (size_t i = 0; i < data.size(); i++) {
                     data[i] = rand() % m;
                 }
-                ggml_backend_tensor_set(t, data.data(), 0, r * be1 * be2 * sizeof(int));
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int));
             } else {
                 init_tensor_uniform(t);
             }
@@ -7191,6 +7206,49 @@ struct test_group_norm_mul_add : public test_case {
     }
 };
 
+// GGML_OP_L2_NORM x N: independent same-shape norms in one graph (strided qkv views or
+// contiguous), consuming adds nested so the norms stay adjacent in the graph.
+struct test_l2_norm_batch : public test_case {
+    const ggml_type              type;
+    const std::array<int64_t, 4> ne;
+    const int                    n_norms;
+    const float                  eps;
+    const bool                   strided;
+
+    std::string vars() override { return VARS_TO_STR5(type, ne, n_norms, eps, strided); }
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "L2_NORM_BATCH"; }
+    bool run_whole_graph() override { return true; }
+
+    test_l2_norm_batch(ggml_type type = GGML_TYPE_F32, std::array<int64_t, 4> ne = { 128, 16, 16, 1 },
+                       int n_norms = 4, float eps = 1e-12f, bool strided = true)
+        : type(type), ne(ne), n_norms(n_norms), eps(eps), strided(strided) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        GGML_ASSERT(n_norms >= 2 && n_norms <= 8);
+        ggml_tensor * parent = nullptr;
+        if (strided) {
+            parent = ggml_new_tensor_4d(ctx, type, ne[0], ne[1] * n_norms, ne[2], ne[3]);  // qkv buffer
+        }
+        ggml_tensor * norms[8];
+        for (int t = 0; t < n_norms; ++t) {
+            ggml_tensor * src;
+            if (strided) {
+                src = ggml_view_4d(ctx, parent, ne[0], ne[1], ne[2], ne[3], parent->nb[1], parent->nb[2],
+                                   parent->nb[3], t * ne[1] * parent->nb[1]);
+            } else {
+                src = ggml_new_tensor(ctx, type, 4, ne.data());
+            }
+            norms[t] = ggml_l2_norm(ctx, src, eps);
+        }
+        ggml_tensor * out = norms[n_norms - 1];
+        for (int t = n_norms - 2; t >= 0; --t) {
+            out = ggml_add(ctx, norms[t], out);
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_L2_NORM
 struct test_l2_norm : public test_case {
     const ggml_type type;
@@ -8792,6 +8850,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_comb(17, 4));
     test_cases.emplace_back(new test_dsv4_hc_comb(257, 8));
     test_cases.emplace_back(new test_dsv4_hc_comb(17, 20));
+    // production n_iter (DeepSeek-V4 uses 20) across batch sizes that cross
+    // subgroup and workgroup boundaries; 1 = single-token decode
+    for (int64_t n_tokens : {1, 256, 336, 512, 513, 1024, 2048}) {
+        test_cases.emplace_back(new test_dsv4_hc_comb(n_tokens, 20));
+    }
 
     test_cases.emplace_back(new test_dsv4_hc_pre(1, 1));
     test_cases.emplace_back(new test_dsv4_hc_pre(31, 17));
@@ -8848,13 +8911,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (ggml_type type : all_types) {
         for (int b : {1, 7}) {
             for (bool v : {false, true}) {
-                test_cases.emplace_back(new test_get_rows(type, 256, 5, 4, b, 1, v));
+                for (bool vs0 : {false, true}) {
+                    test_cases.emplace_back(new test_get_rows(type, 256, 5, 4, b, 1, v, vs0));
+                }
             }
         }
     }
     for (int b : {1, 7}) {
         for (bool v : {false, true}) {
-            test_cases.emplace_back(new test_get_rows(GGML_TYPE_I32, 256, 5, 4, b, 1, v));
+            for (bool vs0 : {false, true}) {
+                test_cases.emplace_back(new test_get_rows(GGML_TYPE_I32, 256, 5, 4, b, 1, v, vs0));
+            }
         }
     }
 
@@ -9471,6 +9538,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_l2_norm(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, false));
             test_cases.emplace_back(new test_l2_norm(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, true));
             test_cases.emplace_back(new test_l2_norm(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, false, true));
+            // sibling batching: strided (production shape) and contiguous, 2 and 4 wide
+            test_cases.emplace_back(new test_l2_norm_batch(GGML_TYPE_F32, { n, 5, 4, 3 }, 2, eps, true));
+            test_cases.emplace_back(new test_l2_norm_batch(GGML_TYPE_F32, { n, 5, 4, 3 }, 4, eps, true));
+            test_cases.emplace_back(new test_l2_norm_batch(GGML_TYPE_F32, { n, 5, 4, 3 }, 4, eps, false));
         }
         // row lengths that are not a multiple of 32, for the scalar (33) and float4 (132, 260) paths
         for (uint32_t n : { 33, 132, 260 }) {
@@ -11156,6 +11227,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             }
         }
     }
+
+    // launch-overhead isolation: single L2_NORM launch vs batched siblings at the GDN
+    // production shape (strided qkv views) -- perf-mode only, the eval list has its own
+    // 2/4-wide coverage
+    for (int n : { 128, 256 }) {
+        test_cases.emplace_back(new test_l2_norm(GGML_TYPE_F32, { n, 16, 16, 1 }, 1e-12f, false, false));
+        test_cases.emplace_back(new test_l2_norm_batch(GGML_TYPE_F32, { n, 16, 16, 1 }, 2, 1e-12f, true));
+        test_cases.emplace_back(new test_l2_norm_batch(GGML_TYPE_F32, { n, 16, 16, 1 }, 4, 1e-12f, true));
+    }
+
 
     return test_cases;
 }
