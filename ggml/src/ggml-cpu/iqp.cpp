@@ -13,6 +13,7 @@
 #include <cstring>
 
 #include "iqp.h"
+#include "avx1-panel-utils.h"
 
 #define UNUSED GGML_UNUSED
 
@@ -137,6 +138,8 @@ static inline void iqp_store_signed_x4(int8_t * GGML_RESTRICT dst,
     const __m256i m = iqp_sign_mask(iqp_sign_bytes(signs));
 
     _mm256_storeu_si256((__m256i *) dst, iqp_apply_signs(g, m));
+#elif defined(__AVX__)
+    ggml_avx1_iqp_signed_x4(dst, g0a, g0b, g1a, g1b, g2a, g2b, g3a, g3b, signs);
 #else
     const uint32_t ga[4] = { g0a, g1a, g2a, g3a };
     const uint32_t gb[4] = { g0b, g1b, g2b, g3b };
@@ -707,6 +710,11 @@ static void iqp_decode_panel_8(enum ggml_type               type,
 #if defined(__AVX2__)
         for (int grp = 0; grp < QK_K / 32; grp++) {
             iqp_interleave_x8(dst->qs + grp * 256, vals, grp * 32);
+        }
+#elif defined(__AVX__)
+        static_assert(QK_K == 256, "AVX1 panel helper expects 256 weights");
+        for (int grp = 0; grp < QK_K / 32; ++grp) {
+            ggml_avx1_iqp_interleave8x32(dst->qs + grp * 256, vals, grp * 32);
         }
 #else
         for (int r = 0; r < IQP_NB_ROWS; r++) {
@@ -1384,8 +1392,13 @@ static bool iqp_supported_common(const struct ggml_tensor * dst) {
         return false;
     }
 #elif defined(__AVX__)
-    // The AVX1 panel kernel currently covers IQ4_XS only. Other IQ formats keep their compact vec_dot paths.
-    if (src0->type != GGML_TYPE_IQ4_XS || !ggml_cpu_has_avx()) {
+    static const bool iq3_enabled = [] {
+        const char * value = std::getenv("GGML_AVX1_IQ3_PANEL");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    const bool supported_type = src0->type == GGML_TYPE_IQ4_XS ||
+        (iq3_enabled && src0->type == GGML_TYPE_IQ3_XXS);
+    if (!supported_type || !ggml_cpu_has_avx()) {
         return false;
     }
 #else
