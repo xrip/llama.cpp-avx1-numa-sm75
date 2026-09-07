@@ -916,6 +916,62 @@ static __device__ __forceinline__ float vec_dot_q3_K_q8_1(
     return vec_dot_q3_K_q8_1_impl_mmvq(vl, vh, u, bq3_K->scales, scale_offset, d, d8);
 }
 
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_TURING
+struct sm75_q4_K_decoded {
+    int values[4];
+    uint16_t scales;
+    uint16_t mins;
+    float2 dm;
+};
+
+static __device__ __forceinline__ sm75_q4_K_decoded sm75_q4_K_decode(const void * vx, int kbx, int iqs) {
+    static_assert(QR4_K == 2 && QI8_1 == 8 && VDR_Q4_K_Q8_1_MMVQ == 2, "Q4_K reuse expects two words per lane");
+    const block_q4_K * b = (const block_q4_K *) vx + kbx;
+    const int offset = QR4_K * ((iqs / 2) / (QI8_1 / 2));
+    const int * q = (const int *) (b->qs + 16 * offset + 4 * ((iqs / 2) % 4));
+    sm75_q4_K_decoded w;
+#pragma unroll
+    for (int i = 0; i < QR4_K; ++i) {
+        w.values[2 * i] = (q[0] >> (4 * i)) & 0x0f0f0f0f;
+        w.values[2 * i + 1] = (q[4] >> (4 * i)) & 0x0f0f0f0f;
+    }
+    const uint32_t * scales = (const uint32_t *) b->scales;
+    const int j = offset / 2;
+    const int shift = 16 * (j & 1);
+    const uint16_t s0 = scales[0] >> shift;
+    const uint16_t s1 = scales[1] >> shift;
+    if (j < 2) {
+        w.scales = s0 & 0x3f3f;
+        w.mins = s1 & 0x3f3f;
+    } else {
+        const uint16_t s2 = scales[2] >> shift;
+        w.scales = (s2 & 0x0f0f) | ((s0 & 0xc0c0) >> 2);
+        w.mins = ((s2 >> 4) & 0x0f0f) | ((s1 & 0xc0c0) >> 2);
+    }
+    w.dm = __half22float2(b->dm);
+    return w;
+}
+
+static __device__ __forceinline__ float sm75_q4_K_dot(const sm75_q4_K_decoded & w, const block_q8_1 * y, int iqs) {
+    const int offset = QR4_K * ((iqs / 2) / (QI8_1 / 2));
+    float sum_d = 0.0f;
+    float sum_m = 0.0f;
+#pragma unroll
+    for (int i = 0; i < QR4_K; ++i) {
+        const block_q8_1 * b = y + offset + i;
+        const int * q = (const int *) b->qs + ((iqs / 2) % 4);
+        const int dot = ggml_cuda_dp4a(w.values[2 * i + 1], q[4], ggml_cuda_dp4a(w.values[2 * i], q[0], 0));
+        const int sum = ggml_cuda_dp4a(0x01010101, q[4], ggml_cuda_dp4a(0x01010101, q[0], 0));
+        const int scale = (w.scales >> (8 * i)) & 0xff;
+        const int min = (w.mins >> (8 * i)) & 0xff;
+        const float d = __low2float(b->ds);
+        sum_d += d * (dot * scale);
+        sum_m += d * (sum * min);
+    }
+    return w.dm.x * sum_d - w.dm.y * sum_m;
+}
+#endif
+
 static __device__ __forceinline__ float vec_dot_q4_K_q8_1(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
 

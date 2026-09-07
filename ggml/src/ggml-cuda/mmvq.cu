@@ -676,6 +676,30 @@ static __global__ void mul_mat_vec_q(
         // x block quant index when casting the quants to int
         const int kqs = vdr * (tid % (qi/vdr));
 
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_TURING
+        if constexpr (type == GGML_TYPE_Q4_K && ncols_dst >= 2 && ncols_dst <= 4) {
+#pragma unroll
+            for (int i = 0; i < rows_per_cuda_block; ++i) {
+                const int bx = kbx_offset + i * stride_row_x + kbx;
+                const sm75_q4_K_decoded w = sm75_q4_K_decode(vx, bx, kqs);
+#pragma unroll
+                for (int j = 0; j < ncols_dst; ++j) {
+                    tmp[j][i] += sm75_q4_K_dot(w, &y[j * stride_col_y + kby], kqs);
+                }
+                if constexpr (has_fusion) {
+                    if (use_gate) {
+                        const sm75_q4_K_decoded gate = sm75_q4_K_decode(vgate, bx, kqs);
+#pragma unroll
+                        for (int j = 0; j < ncols_dst; ++j) {
+                            tmp_gate[j][i] += sm75_q4_K_dot(gate, &y[j * stride_col_y + kby], kqs);
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+#endif
+
 #pragma unroll
         for (int j = 0; j < ncols_dst; ++j) {
 #pragma unroll
