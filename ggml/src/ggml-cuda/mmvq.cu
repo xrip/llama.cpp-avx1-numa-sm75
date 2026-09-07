@@ -367,6 +367,24 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
                 return ne11 <= MMVQ_MAX_BATCH_SIZE;
         }
     }
+    if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_TURING) {
+        // Tuned on a CMP 50HX. Turing had no entry here and fell through to
+        // ne11 <= 8, but MMQ overtakes MMVQ much earlier than that: by n=8 it
+        // is 1.7x-2.6x faster depending on the type. Only the types measured
+        // are listed; the rest keep the default.
+        switch (type) {
+            case GGML_TYPE_Q2_K:
+            case GGML_TYPE_Q3_K:
+                return ne11 <= 2;
+            case GGML_TYPE_Q4_K:
+            case GGML_TYPE_Q5_K:
+            case GGML_TYPE_Q6_K:
+            case GGML_TYPE_IQ4_XS:
+                return ne11 <= 3;
+            default:
+                return ne11 <= MMVQ_MAX_BATCH_SIZE;
+        }
+    }
     if (GGML_CUDA_CC_IS_CDNA(cc)) {
         if (GGML_CUDA_CC_IS_CDNA1(cc)) {
             switch (type) {
