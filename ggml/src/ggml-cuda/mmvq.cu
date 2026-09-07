@@ -367,11 +367,19 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
                 return ne11 <= MMVQ_MAX_BATCH_SIZE;
         }
     }
+#ifndef GGML_CUDA_FORCE_CUBLAS
     if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_TURING) {
         // Tuned on a CMP 50HX. Turing had no entry here and fell through to
         // ne11 <= 8, but MMQ overtakes MMVQ much earlier than that: by n=8 it
         // is 1.7x-2.6x faster depending on the type. Only the types measured
         // are listed; the rest keep the default.
+        //
+        // Guarded against GGML_CUDA_FORCE_CUBLAS: that option makes
+        // ggml_cuda_should_use_mmq() return false unconditionally, so lowering
+        // the threshold there would route small batches into cuBLAS, which has
+        // to dequantise the whole weight to F16 for a handful of columns,
+        // rather than into MMQ. The thresholds below were measured against MMQ
+        // and do not transfer to that configuration.
         switch (type) {
             case GGML_TYPE_Q2_K:
             case GGML_TYPE_Q3_K:
@@ -385,6 +393,7 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
                 return ne11 <= MMVQ_MAX_BATCH_SIZE;
         }
     }
+#endif // GGML_CUDA_FORCE_CUBLAS
     if (GGML_CUDA_CC_IS_CDNA(cc)) {
         if (GGML_CUDA_CC_IS_CDNA1(cc)) {
             switch (type) {
