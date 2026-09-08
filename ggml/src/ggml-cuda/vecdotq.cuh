@@ -1045,6 +1045,48 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1(
 #define VDR_IQ2_XXS_Q8_1_MMVQ 2
 #define VDR_IQ2_XXS_Q8_1_MMQ  2
 
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_TURING
+// Identical maths to vec_dot_iq2_xxs_q8_1, but the codebook is read from shared
+// memory. Nsight on SM75 shows this kernel stalling almost entirely on
+// lg_throttle (19.81 per issue, 43x the next reason) -- the load/store unit's
+// instruction queue is full, while the MIO/shared pipe is idle (mio_throttle
+// 0.06). L1 hit rate is already 98%, so this is not about cache misses: a global
+// load occupies an LG issue slot whether or not it hits. Turning the four grid
+// lookups into LDS moves them onto the pipe that has capacity.
+static __device__ __forceinline__ float vec_dot_iq2_xxs_q8_1_sgrid(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs,
+    const uint64_t * __restrict__ s_grid) {
+
+    const block_iq2_xxs * bq2 = (const block_iq2_xxs *) vbq + kbx;
+
+    const int q2 = get_int_b2(bq2->qs, iqs);
+    const uint8_t * aux8 = (const uint8_t *) &q2;
+    const uint32_t aux32 = get_int_b2(bq2->qs, iqs + 1);
+
+    int sumi = 0;
+#pragma unroll
+    for (int k0 = 0; k0 < 8; k0 += 2) {
+        const uint2    grid_pos = ((const uint2 *) s_grid)[aux8[k0/2]];
+        const uint32_t signs    = unpack_ksigns(aux32 >> (7 * k0 / 2));
+
+        const int signs0 = __vcmpne4(signs & 0x08040201, 0);
+        const int grid0  = __vsub4(grid_pos.x ^ signs0, signs0);
+        const int u0     = get_int_b4(bq8_1[iqs/2].qs, k0 + 0);
+        sumi = ggml_cuda_dp4a(grid0, u0, sumi);
+
+        const int signs1 = __vcmpne4(signs & 0x80402010, 0);
+        const int grid1  = __vsub4(grid_pos.y ^ signs1, signs1);
+        const int u1     = get_int_b4(bq8_1[iqs/2].qs, k0 + 1);
+        sumi = ggml_cuda_dp4a(grid1, u1, sumi);
+    }
+
+    const int ls = aux32 >> 27 | 1; // (scale * 2 + 1)
+    sumi = sumi * ls / 8;           // (sumi * scale + sumi / 2) / 4
+    const float d = __half2float(bq2->d) * __low2float(bq8_1[iqs/2].ds);
+    return d * sumi;
+}
+#endif
+
 static __device__ __forceinline__ float vec_dot_iq2_xxs_q8_1(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
 

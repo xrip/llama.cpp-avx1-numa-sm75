@@ -726,6 +726,21 @@ static __global__ void mul_mat_vec_q(
     const block_q8_1 * y = ((const block_q8_1 *) vy) + sample_y*stride_sample_y + channel_y*stride_channel_y;
     const int kbx_offset = sample_x*stride_sample_x + channel_x*stride_channel_x + row0*stride_row_x;
 
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_TURING
+    // Stage the IQ2_XXS codebook in shared memory once per block. The kernel is
+    // not cache- or bandwidth-limited (L1 98%, DRAM 23%) but stalls on
+    // lg_throttle 19.81/issue: the global load/store issue queue is saturated
+    // while the shared/MIO pipe is idle at 0.06. Only 2 KiB, and it takes four
+    // LDG per vec_dot call off the contended pipe.
+    __shared__ uint64_t s_iq2xxs_grid[type == GGML_TYPE_IQ2_XXS ? 256 : 1];
+    if constexpr (type == GGML_TYPE_IQ2_XXS) {
+        for (int i = tid; i < 256; i += nwarps*warp_size) {
+            s_iq2xxs_grid[i] = iq2xxs_grid[i];
+        }
+        __syncthreads();
+    }
+#endif
+
     for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
         const int kby = kbx * (qk/QK8_1); // y block index that aligns with kbx
 
@@ -749,6 +764,26 @@ static __global__ void mul_mat_vec_q(
                     }
                 }
             }
+        }
+#endif
+
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_TURING
+        if constexpr (type == GGML_TYPE_IQ2_XXS) {
+#pragma unroll
+            for (int j = 0; j < ncols_dst; ++j) {
+#pragma unroll
+                for (int i = 0; i < rows_per_cuda_block; ++i) {
+                    tmp[j][i] += vec_dot_iq2_xxs_q8_1_sgrid(
+                        vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs, s_iq2xxs_grid);
+                    if constexpr (has_fusion) {
+                        if (use_gate) {
+                            tmp_gate[j][i] += vec_dot_iq2_xxs_q8_1_sgrid(
+                                vgate, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs, s_iq2xxs_grid);
+                        }
+                    }
+                }
+            }
+            continue;
         }
 #endif
 
