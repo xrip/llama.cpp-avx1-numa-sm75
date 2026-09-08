@@ -1045,58 +1045,6 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1(
 #define VDR_IQ2_XXS_Q8_1_MMVQ 2
 #define VDR_IQ2_XXS_Q8_1_MMQ  2
 
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_TURING
-// Weight-side decode of one IQ2_XXS block, hoisted out of the ncols_dst loop.
-// The grid lookups and sign expansion depend only on the weights, but mmvq
-// redoes them for every output column; the four uint2 grid loads are irregular
-// and are the expensive part. Only the dp4a accumulation needs the activations.
-// Note the block is 66 bytes with qs at offset 2, so the loads cannot be
-// widened the way IQ4_XS allows -- get_int_b2 stays.
-struct sm75_iq2_xxs_decoded {
-    int   grid[8];
-    int   ls;
-    float d;
-};
-
-static __device__ __forceinline__ sm75_iq2_xxs_decoded sm75_iq2_xxs_decode(const void * vx, int kbx, int iqs) {
-    const block_iq2_xxs * bq2 = (const block_iq2_xxs *) vx + kbx;
-
-    const int       q2    = get_int_b2(bq2->qs, iqs);
-    const uint8_t * aux8  = (const uint8_t *) &q2;
-    const uint32_t  aux32 = get_int_b2(bq2->qs, iqs + 1);
-
-    sm75_iq2_xxs_decoded w;
-#pragma unroll
-    for (int k0 = 0; k0 < 8; k0 += 2) {
-        const uint2    grid_pos = ((const uint2 *) iq2xxs_grid)[aux8[k0/2]];
-        const uint32_t signs    = unpack_ksigns(aux32 >> (7 * k0 / 2));
-
-        const int signs0 = __vcmpne4(signs & 0x08040201, 0);
-        w.grid[k0 + 0]   = __vsub4(grid_pos.x ^ signs0, signs0);
-
-        const int signs1 = __vcmpne4(signs & 0x80402010, 0);
-        w.grid[k0 + 1]   = __vsub4(grid_pos.y ^ signs1, signs1);
-    }
-    w.ls = aux32 >> 27 | 1; // (scale * 2 + 1)
-    w.d  = __half2float(bq2->d);
-    return w;
-}
-
-static __device__ __forceinline__ float sm75_iq2_xxs_dot(const sm75_iq2_xxs_decoded & w, const block_q8_1 * bq8) {
-    int sumi = 0;
-#pragma unroll
-    for (int k0 = 0; k0 < 8; k0 += 2) {
-        const int u0 = get_int_b4(bq8->qs, k0 + 0);
-        sumi = ggml_cuda_dp4a(w.grid[k0 + 0], u0, sumi);
-
-        const int u1 = get_int_b4(bq8->qs, k0 + 1);
-        sumi = ggml_cuda_dp4a(w.grid[k0 + 1], u1, sumi);
-    }
-    sumi = sumi * w.ls / 8; // (sumi * scale + sumi / 2) / 4
-    return w.d * __low2float(bq8->ds) * sumi;
-}
-#endif
-
 static __device__ __forceinline__ float vec_dot_iq2_xxs_q8_1(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
 
