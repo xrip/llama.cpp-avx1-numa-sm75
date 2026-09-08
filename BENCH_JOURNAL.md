@@ -300,3 +300,78 @@ Reverted in `a261f5e95`. Implementation was correct; the premise was wrong.
 state is small *and* the eliminated work is expensive (cache-missing loads or
 long dependency chains). Check the grid/table size first — if it fits in L1,
 reuse will not pay for the register pressure.
+
+---
+
+## 9. SM75 shared-memory codebooks — **+6% tg on a real model**
+
+Found by profiling, after two kernel ideas written from plausible reasoning both
+failed. Nsight works on this card via the CMP unlock (Ubuntu `nsight-compute`
+2022.4.1 + the hash-gated patch); `ERR_NVCMPGPU` is not a hard limit.
+
+### Diagnosis
+
+`mul_mat_vec_q<IQ2_XXS, ncols=1>`, grid 4096 x block (32,4):
+
+| metric | value | reading |
+|---|---|---|
+| **`lg_throttle`** | **19.81/issue** | **43x the next stall — the bottleneck** |
+| `wait` | 1.43 | |
+| `long_scoreboard` | 0.46 | not memory latency |
+| `mio_throttle` | 0.06 | shared/MIO pipe idle |
+| L1 hit | 98.04% | not a cache problem |
+| DRAM / SM | 22.99% / 28.54% | neither saturated |
+| occupancy | 92.82% | not warp-starved |
+
+The load/store **instruction queue** is full. A `vec_dot` issues ~16 loads
+(4x16-bit from `get_int_b2`, 4x64-bit codebook, 8x32-bit activations), and a load
+costs an LG issue slot **even when it hits L1**.
+
+### Fix
+
+Stage the codebook in shared memory once per block: `LDG` -> `LDS`, moving that
+traffic to the idle MIO pipe. Grids are 1-8 KiB and fit easily.
+
+Counters after: `lg_throttle` **19.81 -> 11.59**, `mio_throttle` 0.06 -> 0.14,
+DRAM 23% -> 27.9%, SM 28.5% -> 36.1%.
+
+### Kernel results (n=1, m=4096, k=14336)
+
+| type | delta |
+|---|---|
+| iq3_s | **-15.7%** |
+| iq2_xxs | **-13.6%** |
+| iq3_xxs | -11.0% |
+| iq2_xs | -10.2% |
+| iq2_s | -9.2% |
+| iq1_s | -5.2% |
+
+IQ1_S/IQ1_M are gated to `ncols_dst <= 2`: they win at n=1/n=2 (-5.2%/-11.1%)
+and lose at n>=4 (+7.7%/+2.2%) because the 8 KiB `iq1s_grid_gpu` costs a block
+of occupancy per SM. IQ2_S is also 8 KiB and wins at every n, so size alone is
+not the deciding factor.
+
+### End to end — `llama-server`, Qwen3.8-27B-UD-IQ2_XXS, 16384-token prompt
+
+| arm | prefill t/s | tg t/s |
+|---|---|---|
+| base | 699.17 | 19.213 |
+| shared codebooks | 697.15 | **20.361** |
+| | **-0.29%** (control) | **+5.98%** |
+
+Raw tg, 3 alternating model loads: base `19.448 / 19.213 / 19.144`,
+sgrid `20.455 / 20.361 / 20.290` — distributions do not overlap.
+
+**The prefill column is the control**: at `-ub 2048` prefill goes through cuBLAS,
+which the change does not touch, so it must stay flat. It does. Only the mmvq
+path moved. Correctness: all 7 grid types and `MUL_MAT_ID` pass 2/2 backends.
+
+### Two measurement traps hit while doing this
+
+1. **Ordering bias.** Running all-base-then-all-exp let the first base invocation
+   of each pass catch the 645 MHz idle clock, producing a bogus **-78%** for
+   iq2_xxs. Alternate base/exp *per type* and discard a warm-up invocation.
+2. **Gating on the wrong batch size.** IQ1 was first excluded outright on the
+   strength of its n=4/n=8 regression — but token generation is `ncols_dst == 1`,
+   where IQ1_S is 5.2% *faster*. Excluding it would have removed a win from the
+   only path that mattered. Check which `n` the workload actually uses.
