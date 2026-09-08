@@ -733,18 +733,21 @@ static __global__ void mul_mat_vec_q(
     // queue is saturated while the shared/MIO pipe is idle at 0.06. A load costs
     // an LG issue slot even when it hits L1, so moving the codebook to LDS takes
     // that traffic off the contended pipe. Measured -13.6% on IQ2_XXS at n=1.
-    // IQ1_S and IQ1_M are deliberately excluded. They share the 8 KiB
-    // iq1s_grid_gpu, and at 128 threads/block that costs a block of occupancy
-    // per SM (8 -> 7). Measured: iq1_s +8.0% at n=4, iq1_m +13.5% at n=8, i.e.
-    // slower. IQ2_S is also 8 KiB but wins, so the cost is not size alone --
-    // the IQ1 kernels do fewer codebook loads per call, so they have less
-    // LG-pipe pressure to relieve and the occupancy loss dominates.
+    // IQ1_S and IQ1_M share the 8 KiB iq1s_grid_gpu, which at 128 threads/block
+    // costs a block of occupancy per SM (8 -> 7). Measured, spreads <= 0.2%:
+    //   iq1_s  n=1 -5.2%   n=2 -11.1%   n=4 +7.7%   n=8 +2.2%
+    // so they win where the codebook traffic dominates and lose once the extra
+    // columns need the occupancy back. Restrict them to ncols_dst <= 2; token
+    // generation is ncols_dst == 1 and keeps the gain. IQ2_S is also 8 KiB but
+    // wins at every n (-9% to -16%), so size alone is not the deciding factor.
+    constexpr bool iq1_shared = (type == GGML_TYPE_IQ1_S || type == GGML_TYPE_IQ1_M) && ncols_dst <= 2;
     constexpr int sgrid_u32 =
         type == GGML_TYPE_IQ2_XXS ?  256*2 :
         type == GGML_TYPE_IQ2_XS  ?  512*2 :
         type == GGML_TYPE_IQ2_S   ? 1024*2 :
         type == GGML_TYPE_IQ3_XXS ?  256   :
-        type == GGML_TYPE_IQ3_S   ?  512   : 0;
+        type == GGML_TYPE_IQ3_S   ?  512   :
+        iq1_shared                ? 2048   : 0;
 
     __shared__ uint32_t s_grid[sgrid_u32 > 0 ? sgrid_u32 : 1];
     if constexpr (sgrid_u32 > 0) {
@@ -754,7 +757,8 @@ static __global__ void mul_mat_vec_q(
         else if constexpr (type == GGML_TYPE_IQ2_S  ) { g_grid = (const uint32_t *) iq2s_grid;    }
         else if constexpr (type == GGML_TYPE_IQ3_XXS) { g_grid = (const uint32_t *) iq3xxs_grid;  }
         else if constexpr (type == GGML_TYPE_IQ3_S  ) { g_grid = (const uint32_t *) iq3s_grid;    }
-        else                                          { g_grid = (const uint32_t *) iq3s_grid;     }
+        else if constexpr (type == GGML_TYPE_IQ3_S  ) { g_grid = (const uint32_t *) iq3s_grid;    }
+        else                                          { g_grid = (const uint32_t *) iq1s_grid_gpu; }
         for (int i = tid; i < sgrid_u32; i += nwarps*warp_size) {
             s_grid[i] = g_grid[i];
         }
@@ -799,8 +803,12 @@ static __global__ void mul_mat_vec_q(
                     return vec_dot_iq2_s_q8_1_sgrid  (vsrc, by, bx, kqs, (const uint64_t *) s_grid);
                 } else if constexpr (type == GGML_TYPE_IQ3_XXS) {
                     return vec_dot_iq3_xxs_q8_1_sgrid(vsrc, by, bx, kqs, s_grid);
-                } else {
+                } else if constexpr (type == GGML_TYPE_IQ3_S) {
                     return vec_dot_iq3_s_q8_1_sgrid  (vsrc, by, bx, kqs, s_grid);
+                } else if constexpr (type == GGML_TYPE_IQ1_S) {
+                    return vec_dot_iq1_s_q8_1_sgrid  (vsrc, by, bx, kqs, s_grid);
+                } else {
+                    return vec_dot_iq1_m_q8_1_sgrid  (vsrc, by, bx, kqs, s_grid);
                 }
             };
 #pragma unroll
