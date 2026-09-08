@@ -727,15 +727,31 @@ static __global__ void mul_mat_vec_q(
     const int kbx_offset = sample_x*stride_sample_x + channel_x*stride_channel_x + row0*stride_row_x;
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_TURING
-    // Stage the IQ2_XXS codebook in shared memory once per block. The kernel is
-    // not cache- or bandwidth-limited (L1 98%, DRAM 23%) but stalls on
-    // lg_throttle 19.81/issue: the global load/store issue queue is saturated
-    // while the shared/MIO pipe is idle at 0.06. Only 2 KiB, and it takes four
-    // LDG per vec_dot call off the contended pipe.
-    __shared__ uint64_t s_iq2xxs_grid[type == GGML_TYPE_IQ2_XXS ? 256 : 1];
-    if constexpr (type == GGML_TYPE_IQ2_XXS) {
-        for (int i = tid; i < 256; i += nwarps*warp_size) {
-            s_iq2xxs_grid[i] = iq2xxs_grid[i];
+    // Stage the codebook in shared memory once per block for the grid-based
+    // quants. These kernels are not cache- or bandwidth-limited (L1 98%, DRAM
+    // 23%) but stall on lg_throttle 19.81/issue: the global load/store issue
+    // queue is saturated while the shared/MIO pipe is idle at 0.06. A load costs
+    // an LG issue slot even when it hits L1, so moving the codebook to LDS takes
+    // that traffic off the contended pipe. Measured -13.6% on IQ2_XXS at n=1.
+    constexpr int sgrid_u32 =
+        type == GGML_TYPE_IQ2_XXS ?  256*2 :
+        type == GGML_TYPE_IQ2_XS  ?  512*2 :
+        type == GGML_TYPE_IQ2_S   ? 1024*2 :
+        type == GGML_TYPE_IQ3_XXS ?  256   :
+        type == GGML_TYPE_IQ3_S   ?  512   :
+        (type == GGML_TYPE_IQ1_S || type == GGML_TYPE_IQ1_M) ? 2048 : 0;
+
+    __shared__ uint32_t s_grid[sgrid_u32 > 0 ? sgrid_u32 : 1];
+    if constexpr (sgrid_u32 > 0) {
+        const uint32_t * g_grid = nullptr;
+        if constexpr (type == GGML_TYPE_IQ2_XXS) { g_grid = (const uint32_t *) iq2xxs_grid;   }
+        else if constexpr (type == GGML_TYPE_IQ2_XS ) { g_grid = (const uint32_t *) iq2xs_grid;   }
+        else if constexpr (type == GGML_TYPE_IQ2_S  ) { g_grid = (const uint32_t *) iq2s_grid;    }
+        else if constexpr (type == GGML_TYPE_IQ3_XXS) { g_grid = (const uint32_t *) iq3xxs_grid;  }
+        else if constexpr (type == GGML_TYPE_IQ3_S  ) { g_grid = (const uint32_t *) iq3s_grid;    }
+        else                                          { g_grid = (const uint32_t *) iq1s_grid_gpu; }
+        for (int i = tid; i < sgrid_u32; i += nwarps*warp_size) {
+            s_grid[i] = g_grid[i];
         }
         __syncthreads();
     }
@@ -768,17 +784,33 @@ static __global__ void mul_mat_vec_q(
 #endif
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_TURING
-        if constexpr (type == GGML_TYPE_IQ2_XXS) {
+        if constexpr (sgrid_u32 > 0) {
+            auto sdot = [&] (const void * vsrc, const block_q8_1 * by, int bx) -> float {
+                if constexpr (type == GGML_TYPE_IQ2_XXS) {
+                    return vec_dot_iq2_xxs_q8_1_sgrid(vsrc, by, bx, kqs, (const uint64_t *) s_grid);
+                } else if constexpr (type == GGML_TYPE_IQ2_XS) {
+                    return vec_dot_iq2_xs_q8_1_sgrid (vsrc, by, bx, kqs, (const uint64_t *) s_grid);
+                } else if constexpr (type == GGML_TYPE_IQ2_S) {
+                    return vec_dot_iq2_s_q8_1_sgrid  (vsrc, by, bx, kqs, (const uint64_t *) s_grid);
+                } else if constexpr (type == GGML_TYPE_IQ3_XXS) {
+                    return vec_dot_iq3_xxs_q8_1_sgrid(vsrc, by, bx, kqs, s_grid);
+                } else if constexpr (type == GGML_TYPE_IQ3_S) {
+                    return vec_dot_iq3_s_q8_1_sgrid  (vsrc, by, bx, kqs, s_grid);
+                } else if constexpr (type == GGML_TYPE_IQ1_S) {
+                    return vec_dot_iq1_s_q8_1_sgrid  (vsrc, by, bx, kqs, s_grid);
+                } else {
+                    return vec_dot_iq1_m_q8_1_sgrid  (vsrc, by, bx, kqs, s_grid);
+                }
+            };
 #pragma unroll
             for (int j = 0; j < ncols_dst; ++j) {
 #pragma unroll
                 for (int i = 0; i < rows_per_cuda_block; ++i) {
-                    tmp[j][i] += vec_dot_iq2_xxs_q8_1_sgrid(
-                        vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs, s_iq2xxs_grid);
+                    const int bx = kbx_offset + i*stride_row_x + kbx;
+                    tmp[j][i] += sdot(vx, &y[j*stride_col_y + kby], bx);
                     if constexpr (has_fusion) {
                         if (use_gate) {
-                            tmp_gate[j][i] += vec_dot_iq2_xxs_q8_1_sgrid(
-                                vgate, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs, s_iq2xxs_grid);
+                            tmp_gate[j][i] += sdot(vgate, &y[j*stride_col_y + kby], bx);
                         }
                     }
                 }
