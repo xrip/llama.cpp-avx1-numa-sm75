@@ -548,6 +548,18 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
                 case GGML_TYPE_Q6_K:
                 case GGML_TYPE_IQ4_XS:
                     return 2;
+                // EXPERIMENT: low-bpw types sit at 23-41% of the f16 bandwidth
+                // ceiling while these fast types reach 78-95%. They currently get
+                // nwarps=4. Probe both directions in one build:
+                //   IQ2_XXS, IQ3_XXS -> 2 (fewer warps, less register pressure)
+                //   IQ2_XS,  IQ3_S   -> 8 (more warps, more memory in flight)
+                //   IQ2_S,   IQ1_M   -> 4 unchanged, as controls
+                case GGML_TYPE_IQ2_XXS:
+                case GGML_TYPE_IQ3_XXS:
+                    return 2;
+                case GGML_TYPE_IQ2_XS:
+                case GGML_TYPE_IQ3_S:
+                    return 8;
                 default:
                     return 4;
             }
