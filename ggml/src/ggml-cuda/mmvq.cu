@@ -7,6 +7,12 @@
 #include <cstdint>
 #include <type_traits>
 
+// Upper ncols_dst bound for the SM75 IQ2_XXS decode-reuse path. Overridable so
+// the range can be swept from the build without editing the source; 0 disables.
+#ifndef SM75_IQ2_XXS_REUSE_MAX
+#define SM75_IQ2_XXS_REUSE_MAX 4
+#endif
+
 // only enabled on DGX Spark, where it is a gain on every type below. On the higher-bandwidth parts the kernel
 // has little exposed latency left to hide and the extra requests cost more than they save.
 // For perf data, see https://github.com/ggml-org/llama.cpp/pull/26705#issuecomment-5569335031
@@ -749,6 +755,30 @@ static __global__ void mul_mat_vec_q(
                     }
                 }
             }
+        }
+#endif
+
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_TURING
+        if constexpr (type == GGML_TYPE_IQ2_XXS && ncols_dst >= 2 && ncols_dst <= SM75_IQ2_XXS_REUSE_MAX) {
+#pragma unroll
+            for (int i = 0; i < rows_per_cuda_block; ++i) {
+                const int bx = kbx_offset + i * stride_row_x + kbx;
+                const sm75_iq2_xxs_decoded w = sm75_iq2_xxs_decode(vx, bx, kqs);
+#pragma unroll
+                for (int j = 0; j < ncols_dst; ++j) {
+                    tmp[j][i] += sm75_iq2_xxs_dot(w, &y[j * stride_col_y + kby + kqs / 2]);
+                }
+                if constexpr (has_fusion) {
+                    if (use_gate) {
+                        const sm75_iq2_xxs_decoded gate = sm75_iq2_xxs_decode(vgate, bx, kqs);
+#pragma unroll
+                        for (int j = 0; j < ncols_dst; ++j) {
+                            tmp_gate[j][i] += sm75_iq2_xxs_dot(gate, &y[j * stride_col_y + kby + kqs / 2]);
+                        }
+                    }
+                }
+            }
+            continue;
         }
 #endif
 
