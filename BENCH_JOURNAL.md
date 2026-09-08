@@ -253,3 +253,50 @@ unreliable until that lands.
 
 Note #4 and #6 apply only to builds **without** `FORCE_CUBLAS`, so they do not
 reach the production configuration.
+
+---
+
+## 8. SM75 IQ2_XXS decode reuse — implemented, measured, **rejected**
+
+Applied the technique that works for IQ4_XS (`sm75_iq4_decode`): hoist the
+weight-side decode out of the `ncols_dst` loop so the four `iq2xxs_grid` lookups
+and sign expansion happen once per block instead of once per output column.
+Gated to Turing, `ncols_dst` 2..4.
+
+Load widening — the *other* IQ4_XS trick — is **impossible** here:
+
+| type | block size | `qs` offset | widening |
+|---|---|---|---|
+| IQ4_XS | 136 B | 8 | `int2` loads OK (existing fork path) |
+| IQ2_XXS | **66 B** | **2** | only 2-byte aligned; `get_int_b2` is required |
+
+66 is 2 mod 4, so block bases are not even 4-byte aligned.
+
+Result, `test-backend-ops perf -p type_a=iq2_xxs`, medians of 5 reps after a
+discarded warmup, interleaved, FORCE_CUBLAS builds:
+
+| n | base us | exp us | delta | |
+|---|---|---|---|---|
+| 1 | 94.19 | 94.19 | +0.00% | control, identical code |
+| 2 | 97.09 | 96.90 | −0.20% | reuse active |
+| 3 | 118.96 | 119.73 | +0.65% | reuse active |
+| 4 | 145.49 | 146.02 | +0.36% | reuse active |
+| 5 | 157.10 | 157.33 | +0.15% | |
+| 8 | 221.22 | 221.06 | −0.07% | |
+| 512 | 1589.06 | 1583.31 | −0.36% | |
+
+**n=2..4 mean +0.27%; noise floor −0.07% (identical-code rows).** No gain.
+Correctness passed (2/2 backends).
+
+**Why it fails where IQ4_XS succeeds:** the decoded state is 8 ints of grid plus
+scale and `d` — about double `sm75_iq4_decoded` — so occupancy drops on Turing,
+while the work saved is nearly free to begin with: `iq2xxs_grid` is 256 x 8 B =
+**2 KB and L1-resident**. IQ4_XS reuse eliminates genuinely expensive work;
+IQ2_XXS reuse eliminates L1 hits.
+
+Reverted in `a261f5e95`. Implementation was correct; the premise was wrong.
+
+**Generalisation for future SM75 work:** decode reuse only pays when the decoded
+state is small *and* the eliminated work is expensive (cache-missing loads or
+long dependency chains). Check the grid/table size first — if it fits in L1,
+reuse will not pay for the register pressure.
