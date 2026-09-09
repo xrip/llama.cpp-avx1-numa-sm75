@@ -13,6 +13,7 @@
 
 #include <array>
 #include <map>
+#include <mutex>
 #include <vector>
 
 struct llama_model;
@@ -39,6 +40,12 @@ struct llama_memory_buffer {
 };
 
 using llama_memory_buffers = std::map<ggml_backend_buffer_type_t, llama_memory_buffer>;
+
+struct llama_compute_share {
+    std::recursive_mutex mutex;
+    llama_context * active = nullptr;
+    llama_context * contexts[2] = {};
+};
 
 struct llama_context {
     // init scheduler and compute buffers, reserve worst-case graphs
@@ -346,6 +353,9 @@ private:
     std::vector<swap_info> output_swaps;
 
     ggml_backend_sched_ptr sched;
+    llama_context * compute_source = nullptr;
+    std::shared_ptr<llama_compute_share> compute_share;
+    std::unique_lock<std::recursive_mutex> lock_compute();
 
     bool sched_need_reserve = true;
 
