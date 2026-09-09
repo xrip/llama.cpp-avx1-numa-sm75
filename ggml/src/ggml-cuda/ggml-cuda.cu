@@ -3442,6 +3442,36 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     ggml_tensor * node = cgraph->nodes[i];
 
+    static const bool fuse_swiglu_q8 = getenv("GGML_CUDA_SM75_SWIGLU_Q8_1") != nullptr && std::atoi(getenv("GGML_CUDA_SM75_SWIGLU_Q8_1"));
+    static const bool trace_swiglu_q8 = getenv("GGML_CUDA_SM75_SWIGLU_Q8_1_TRACE") != nullptr;
+    if (fuse_swiglu_q8 && node->op == GGML_OP_GLU && ggml_get_glu_op(node) == GGML_GLU_OP_SWIGLU &&
+            node->src[1] != nullptr && node->type == GGML_TYPE_F32 && node->ne[1] > 8 &&
+            node->ne[2] == 1 && node->ne[3] == 1 && node->ne[0] % 4 == 0 &&
+            ggml_is_contiguous(node) && ggml_is_contiguous(node->src[0]) && ggml_is_contiguous(node->src[1]) &&
+            ggml_cuda_is_aligned(node->src[0], 16) && ggml_cuda_is_aligned(node->src[1], 16) &&
+            node->src[0]->type == GGML_TYPE_F32 && node->src[1]->type == GGML_TYPE_F32 &&
+            ggml_are_same_shape(node, node->src[0]) && ggml_are_same_shape(node, node->src[1]) &&
+            ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_GLU, GGML_OP_MUL_MAT }, { i + 1 })) {
+        ggml_tensor * dst = cgraph->nodes[i + 1];
+        const ggml_tensor * weight = dst->src[0];
+        const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
+        const bool cublas_batch = node->ne[1] >= 1024 && node->ne[1] <= 2048 &&
+                (weight->type == GGML_TYPE_Q4_K || weight->type == GGML_TYPE_IQ4_XS);
+        const int output_idx = i + 1;
+        if (cc == GGML_CUDA_CC_TURING && !cublas_batch && dst->src[1] == node && dst->type == GGML_TYPE_F32 &&
+                weight->ne[2] == 1 && weight->ne[3] == 1 && ggml_is_contiguous(weight) && ggml_is_contiguous(dst) &&
+                !ggml_backend_buffer_is_host(weight->buffer) &&
+                !ggml_cuda_should_use_mmvq(weight->type, cc, node->ne[1]) &&
+                ggml_cuda_should_use_mmq(weight->type, cc, node->ne[1], 0) &&
+                ggml_cuda_check_fusion_memory_ranges(cgraph, i, 2, &output_idx, 1)) {
+            if (trace_swiglu_q8) {
+                GGML_LOG_INFO("SM75_SWIGLU_Q8_1 type=%s n=%lld k=%lld\n", ggml_type_name(weight->type), (long long) node->ne[1], (long long) node->ne[0]);
+            }
+            ggml_cuda_mul_mat_q(*cuda_ctx, weight, node, nullptr, dst, true);
+            return 1;
+        }
+    }
+
     if (node->op == GGML_OP_MUL) {
         ggml_cuda_moe_weighted_reduction_match match;
         if (ggml_cuda_match_moe_weighted_reduction(cgraph, i, match)) {
