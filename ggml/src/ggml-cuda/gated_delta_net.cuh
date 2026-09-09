@@ -1,5 +1,8 @@
 #include "common.cuh"
 #include "ggml.h"
+#include "ggml-cuda-gdn-transaction.h"
+
+bool ggml_cuda_gdn_replay(const ggml_cuda_gdn_replay_args * args, int32_t count);
 
 // fused-kernel recurrent-state output; strides in elements (per-seq stride is always D, set in-kernel)
 struct ggml_cuda_gated_delta_net_fused_cache {
