@@ -142,6 +142,12 @@ llama_context::llama_context(
 
     cparams.ctx_other = nullptr;
 
+    const char * share_env = std::getenv("LLAMA_SM75_MTP_SHARED_COMPUTE");
+    if (share_env && strcmp(share_env, "1") == 0 && params.ctx_other &&
+            cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && model.arch == LLM_ARCH_QWEN35 && cparams.n_seq_max == 1) {
+        compute_source = params.ctx_other;
+    }
+
     // TODO: more generic
     if (model.arch == LLM_ARCH_GEMMA4_ASSISTANT) {
         if (params.ctx_other == nullptr) {
@@ -479,6 +485,7 @@ llama_context::llama_context(
 }
 
 llama_context::~llama_context() {
+    auto compute_lock = lock_compute();
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
 
@@ -500,6 +507,25 @@ llama_context::~llama_context() {
         }
     }
     ggml_opt_free(opt_ctx);
+    if (compute_share) {
+        compute_share->active = nullptr;
+        for (auto & context : compute_share->contexts) {
+            if (context == this) context = nullptr;
+        }
+        sched.reset();
+    }
+}
+
+std::unique_lock<std::recursive_mutex> llama_context::lock_compute() {
+    if (!compute_share) {
+        return {};
+    }
+    std::unique_lock<std::recursive_mutex> lock(compute_share->mutex);
+    if (compute_share->active && compute_share->active != this) {
+        compute_share->active->synchronize();
+    }
+    compute_share->active = this;
+    return lock;
 }
 
 void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs) {
@@ -580,8 +606,14 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
 }
 
 void llama_context::sched_reserve() {
+    auto compute_lock = lock_compute();
     if (!sched_need_reserve) {
         return;
+    }
+    if (compute_share) {
+        for (auto * context : compute_share->contexts) {
+            if (context && context != this) compute_source = context;
+        }
     }
 
     sched_need_reserve = false;
@@ -678,6 +710,45 @@ void llama_context::sched_reserve() {
         if (!gf) {
             throw std::runtime_error("failed to allocate compute pp buffers");
         }
+    }
+
+    if (compute_source) {
+        int devices = 0;
+        bool supported = (!compute_source->compute_share || compute_source->compute_share == compute_share) &&
+            compute_source->cparams.n_seq_max == 1;
+        for (auto backend : backend_ptrs) {
+            auto dev = ggml_backend_get_device(backend);
+            if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) continue;
+            ++devices;
+            auto reg = ggml_backend_dev_backend_reg(dev);
+            auto supports = (bool (*)(ggml_backend_dev_t)) ggml_backend_reg_get_proc_address(reg, "ggml_cuda_gdn_txn_supported");
+            supported = supported && supports && supports(dev);
+        }
+        // Both graphs must be discarded before either reserved buffer can be replaced.
+        synchronize();
+        compute_source->synchronize();
+        gf_res_prev->reset();
+        gf_res_reserve->reset();
+        compute_source->gf_res_prev->reset();
+        compute_source->gf_res_reserve->reset();
+        ggml_backend_sched_reset(sched.get());
+        ggml_backend_sched_reset(compute_source->sched.get());
+        if (supported && devices == 1 && ggml_backend_sched_share_compute_buffers(sched.get(), compute_source->sched.get())) {
+            if (!compute_share) {
+                compute_share = std::make_shared<llama_compute_share>();
+                compute_share->contexts[0] = this;
+                compute_share->contexts[1] = compute_source;
+            }
+            compute_source->compute_share = compute_share;
+            compute_share->active = this;
+            for (size_t i = 0; i < compute_source->backend_ptrs.size(); ++i) {
+                compute_source->backend_buf_exp_size[i] = ggml_backend_sched_get_buffer_size(compute_source->sched.get(), compute_source->backend_ptrs[i]);
+            }
+            LLAMA_LOG_INFO("%s: shared MTP device compute buffers enabled\n", __func__);
+        } else {
+            LLAMA_LOG_INFO("%s: shared MTP compute unavailable, using separate buffers\n", __func__);
+        }
+        compute_source = nullptr;
     }
 
     for (size_t i = 0; i < backend_ptrs.size(); ++i) {
@@ -1404,6 +1475,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 }
 
 int llama_context::encode(const llama_batch & batch_inp) {
+    auto compute_lock = lock_compute();
     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
     // so accept either present rather than requiring exactly one.
     GGML_ASSERT(batch_inp.token || batch_inp.embd);
@@ -1642,6 +1714,7 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 }
 
 int llama_context::decode(const llama_batch & batch_inp) {
+    auto compute_lock = lock_compute();
     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
     // so accept either present rather than requiring exactly one.
     GGML_ASSERT(batch_inp.token || batch_inp.embd);

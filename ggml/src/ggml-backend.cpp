@@ -1939,6 +1939,22 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     free(sched);
 }
 
+bool ggml_backend_sched_share_compute_buffers(ggml_backend_sched_t dst, ggml_backend_sched_t src) {
+    if (!dst || !src || dst == src || dst->is_alloc || src->is_alloc || dst->n_copies != 1 || src->n_copies != 1 ||
+            dst->n_backends != src->n_backends) {
+        return false;
+    }
+    for (int i = 0; i < dst->n_backends; ++i) {
+        if (dst->bufts[i] != src->bufts[i] ||
+                ggml_backend_get_device(dst->backends[i]) != ggml_backend_get_device(src->backends[i])) {
+            return false;
+        }
+    }
+    ggml_backend_sched_synchronize(src);
+    ggml_backend_sched_synchronize(dst);
+    return ggml_gallocr_share_buffers(dst->galloc, src->galloc);
+}
+
 void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     // reset state for the next run
