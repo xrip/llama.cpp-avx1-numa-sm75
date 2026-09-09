@@ -5709,8 +5709,21 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
+static bool ggml_backend_cuda_gdn_txn_supported(ggml_backend_dev_t dev) {
+    const auto * ctx = (const ggml_backend_cuda_device_context *) dev->context;
+    return ggml_cuda_info().devices[ctx->device].cc == GGML_CUDA_CC_TURING;
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (strcmp(name, "ggml_cuda_gdn_replay") == 0) {
+        return (void *) ggml_cuda_gdn_replay;
+    }
+    if (strcmp(name, "ggml_cuda_gdn_txn_supported") == 0) {
+        return (void *) ggml_backend_cuda_gdn_txn_supported;
+    }
+#endif
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_cuda_comm_init;
     }

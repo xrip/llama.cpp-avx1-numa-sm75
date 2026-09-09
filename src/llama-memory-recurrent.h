@@ -4,6 +4,7 @@
 #include "llama-graph.h"
 #include "llama-memory.h"
 
+#include <algorithm>
 #include <map>
 #include <set>
 #include <vector>
@@ -78,6 +79,9 @@ public:
 
     void set_rs_idx(llama_seq_id seq_id, uint32_t idx);
 
+    bool txn_enabled() const { return use_txn; }
+    void txn_batch(uint32_t n_tokens) { txn_tokens = std::min(n_tokens, n_rs_seq + 1); }
+
     // computed before each graph build
     uint32_t n = 0;
 
@@ -111,6 +115,7 @@ public:
     // per layer
     std::vector<ggml_tensor *> r_l;
     std::vector<ggml_tensor *> s_l;
+    std::vector<ggml_tensor *> txn_l;
     // a second conv history that must stay replicated across devices, so it cannot share the r row
     std::vector<ggml_tensor *> p_l;
 
@@ -119,6 +124,10 @@ private:
     const llama_hparams & hparams;
 
     const uint32_t n_seq_max = 1;
+
+    bool use_txn = false;
+    uint32_t txn_tokens = 0;
+    bool txn_rollback(uint32_t rollback);
 
     // ggml contexts for the KV cache along with the allocated backend buffers:
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
@@ -173,6 +182,8 @@ public:
 
     ggml_tensor * get_r_l(int32_t il) const;
     ggml_tensor * get_s_l(int32_t il) const;
+    ggml_tensor * get_txn_l(int32_t il) const;
+    bool txn_enabled() const { return mem->txn_enabled(); }
     ggml_tensor * get_p_l(int32_t il) const;
 
     int32_t s_copy(int i) const;
