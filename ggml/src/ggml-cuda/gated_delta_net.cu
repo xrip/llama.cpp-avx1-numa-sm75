@@ -27,7 +27,10 @@ gated_delta_net_cuda(const float * q,
                                      const uint3   rq3_magic,
                                      float         scale,
                                      int64_t       state_slot_stride,
-                                     int           K) {
+                                     int           K,
+                                     float *       txn_log,
+                                     float *       txn_prior,
+                                     int           txn_slots) {
     const uint32_t h_idx    = blockIdx.x;
     const uint32_t sequence = blockIdx.y;
     // each warp owns one column, using warp-level primitives to reduce across rows
@@ -61,6 +64,13 @@ gated_delta_net_cuda(const float * q,
     }
 
     for (int t = 0; t < n_tokens; t++) {
+        const int log_start = n_tokens > txn_slots ? n_tokens - txn_slots : 0;
+        if (txn_prior != nullptr && t == log_start) {
+#pragma unroll
+            for (int r = 0; r < rows_per_lane; r++) {
+                txn_prior[state_in_offset + col * S_v + r * warp_size + lane] = s_shard[r];
+            }
+        }
         const float * q_t = q + iq3 * sq3 + t * sq2 + iq1 * sq1;
         const float * k_t = k + iq3 * sq3 + t * sq2 + iq1 * sq1;
         const float * v_t = v + sequence * sv3 + t * sv2 + h_idx * sv1;
@@ -94,6 +104,22 @@ gated_delta_net_cuda(const float * q,
 
             // delta[col] = (v[col] - g * kv[col]) * beta
             float delta_col = (v_t[col] - g_val * kv_col) * beta_val;
+
+            if (txn_log != nullptr && t >= log_start) {
+                float * record = txn_log + (t - log_start) * H * (1 + 2 * S_v);
+                if (col == 0) {
+                    if (lane == 0) {
+                        record[h_idx] = g_val;
+                    }
+#pragma unroll
+                    for (int r = 0; r < rows_per_lane; r++) {
+                        record[H + h_idx * S_v + r * warp_size + lane] = k_reg[r];
+                    }
+                }
+                if (lane == 0) {
+                    record[H + H * S_v + h_idx * S_v + col] = delta_col;
+                }
+            }
 
             // fused: S[i][col] = g * S[i][col] + k[i] * delta[col]
             // attn[col] = (S^T @ q)[col] = sum_i S[i][col] * q[i]
@@ -176,7 +202,8 @@ static void launch_gated_delta_net(
         int64_t sv1,   int64_t sv2, int64_t sv3,
         int64_t sb1,   int64_t sb2, int64_t sb3,
         int64_t neqk1, int64_t rq3,
-        float scale, int64_t state_slot_stride, int K, cudaStream_t stream) {
+        float scale, int64_t state_slot_stride, int K, cudaStream_t stream,
+        float * txn_log = nullptr, float * txn_prior = nullptr, int txn_slots = 0) {
     //TODO: Add chunked kernel for even faster pre-fill
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
     const int num_warps = 4;
@@ -192,26 +219,26 @@ static void launch_gated_delta_net(
             ggml_cuda_kernel_launch(gated_delta_net_cuda<16, KDA, keep_rs_t>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
+                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, txn_log, txn_prior, txn_slots);
             break;
         case 32:
             ggml_cuda_kernel_launch(gated_delta_net_cuda<32, KDA, keep_rs_t>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
+                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, txn_log, txn_prior, txn_slots);
             break;
         case 64: {
             ggml_cuda_kernel_launch(gated_delta_net_cuda<64, KDA, keep_rs_t>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
+                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, txn_log, txn_prior, txn_slots);
             break;
         }
         case 128: {
             ggml_cuda_kernel_launch(gated_delta_net_cuda<128, KDA, keep_rs_t>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
+                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, txn_log, txn_prior, txn_slots);
             break;
         }
         default:
@@ -286,6 +313,21 @@ static void ggml_cuda_op_gated_delta_net_impl(
     const int K = ggml_get_op_params_i32(dst, 0);
     const bool keep_rs = K > 1;
 
+    float * txn_log = nullptr;
+    float * txn_prior = nullptr;
+    int txn_slots = 0;
+    if (dst->src[6] != nullptr) {
+        GGML_ASSERT(!kda && n_seqs == 1 && K == 1 && dst->src[7] != nullptr);
+        GGML_ASSERT(dst->src[6]->type == GGML_TYPE_F32 && dst->src[7]->type == GGML_TYPE_F32);
+        GGML_ASSERT(ggml_is_contiguous(dst->src[6]) && ggml_is_contiguous(dst->src[7]));
+        GGML_ASSERT(dst->src[6]->ne[0] == H * (1 + 2 * S_v));
+        GGML_ASSERT(ggml_nelements(dst->src[7]) == H * S_v * S_v);
+        txn_log = (float *) dst->src[6]->data;
+        txn_prior = (float *) dst->src[7]->data;
+        txn_slots = dst->src[6]->ne[1];
+        GGML_ASSERT(txn_slots > 0);
+    }
+
     // recurrent state -> gdn_out tail (after attention scores), or the cache when fusing
     float * state_d           = dst_d + S_v * H * n_tokens * n_seqs;
     int64_t state_slot_stride = S_v * S_v * H * n_seqs;
@@ -312,7 +354,7 @@ static void ggml_cuda_op_gated_delta_net_impl(
         } else {
             launch_gated_delta_net<false, false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
+                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream, txn_log, txn_prior, txn_slots);
         }
     }
 }
@@ -325,3 +367,81 @@ void ggml_cuda_op_gated_delta_net_fused_cache(
         ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_cuda_gated_delta_net_fused_cache cache) {
     ggml_cuda_op_gated_delta_net_impl(ctx, dst, &cache);
 }
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+template <int S>
+__global__ void gdn_replay_cuda(ggml_cuda_gdn_replay_args a) {
+    const int head = blockIdx.x;
+    const int col = blockIdx.y * blockDim.y + threadIdx.y;
+    const int lane = threadIdx.x;
+    constexpr int warp = S < 32 ? S : 32;
+    const int64_t offset = (int64_t) head * S * S + col * S;
+    float state[S / warp];
+#pragma unroll
+    for (int r = 0; r < S / warp; ++r) {
+        state[r] = a.prior[offset + r * warp + lane];
+    }
+    for (int t = 0; t < a.n_keep; ++t) {
+        const float * record = a.log + t * a.head_count * (1 + 2 * S);
+        const float decay = record[head];
+        const float delta = record[a.head_count * (1 + S) + head * S + col];
+#pragma unroll
+        for (int r = 0; r < S / warp; ++r) {
+            const float key = record[a.head_count + head * S + r * warp + lane];
+            if constexpr (S <= 32) {
+                state[r] = __fmaf_rn(key, delta, __fmul_rn(decay, state[r]));
+            } else {
+                state[r] = __fmaf_rn(decay, state[r], __fmul_rn(key, delta));
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < S / warp; ++r) {
+        a.state[offset + r * warp + lane] = state[r];
+    }
+}
+
+bool ggml_cuda_gdn_replay(const ggml_cuda_gdn_replay_args * args, int32_t count) {
+    if (args == nullptr || count <= 0) {
+        return false;
+    }
+    int device = -1;
+    for (int i = 0; i < count; ++i) {
+        const auto & a = args[i];
+        if (a.head_count <= 0 || a.n_keep < 0 ||
+                (a.state_dim != 16 && a.state_dim != 32 && a.state_dim != 64 && a.state_dim != 128)) {
+            return false;
+        }
+        for (const float * ptr : {a.prior, (const float *) a.state, a.log}) {
+            cudaPointerAttributes attr = {};
+            if (ptr == nullptr || cudaPointerGetAttributes(&attr, ptr) != cudaSuccess) {
+                cudaGetLastError();
+                return false;
+            }
+            if (attr.type != cudaMemoryTypeDevice || (device >= 0 && device != attr.device)) {
+                return false;
+            }
+            device = attr.device;
+        }
+    }
+    const int previous_device = ggml_cuda_get_device();
+    ggml_cuda_set_device(device);
+    // Replay is outside the compute graph and must wait for all state writes.
+    CUDA_CHECK(cudaDeviceSynchronize());
+    for (int i = 0; i < count; ++i) {
+        const auto & a = args[i];
+        const dim3 grid(a.head_count, a.state_dim / 4, 1);
+        const dim3 block(a.state_dim < 32 ? a.state_dim : 32, 4, 1);
+        const ggml_cuda_kernel_launch_params launch(grid, block, 0, nullptr);
+        switch (a.state_dim) {
+            case 16:  ggml_cuda_kernel_launch(gdn_replay_cuda<16>,  launch, a); break;
+            case 32:  ggml_cuda_kernel_launch(gdn_replay_cuda<32>,  launch, a); break;
+            case 64:  ggml_cuda_kernel_launch(gdn_replay_cuda<64>,  launch, a); break;
+            case 128: ggml_cuda_kernel_launch(gdn_replay_cuda<128>, launch, a); break;
+        }
+    }
+    CUDA_CHECK(cudaDeviceSynchronize());
+    ggml_cuda_set_device(previous_device);
+    return true;
+}
+#endif

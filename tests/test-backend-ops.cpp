@@ -1621,6 +1621,10 @@ struct test_case {
             n_runs = (int)std::min<int64_t>(ggml_graph_size(gf) - ggml_graph_n_nodes(gf), target_size / op_size(out)) + 1;
         }
 
+        if (current_op_name == "SWIGLU_MMQ") {
+            n_runs = 1;
+        }
+
         // duplicate the op
         for (int i = 1; i < n_runs; i++) {
             ggml_graph_add_node(gf, out);
@@ -4830,6 +4834,43 @@ struct test_mul_mat : public test_case {
         return ggml_op_name(GGML_OP_MUL_MAT);
     }
 };
+
+struct test_swiglu_mmq : public test_mul_mat {
+    test_swiglu_mmq(ggml_type type, int64_t rows, int64_t tokens, int64_t width)
+        : test_mul_mat(type, GGML_TYPE_F32, rows, tokens, width, {1, 1}, {1, 1}) {}
+
+    bool run_whole_graph() override { return true; }
+
+    std::string op_desc(ggml_tensor *) override { return "SWIGLU_MMQ"; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * weight = ggml_new_tensor_2d(ctx, type_a, k, m);
+        ggml_tensor * gate = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_tensor * up = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        return ggml_mul_mat(ctx, weight, ggml_swiglu_split(ctx, gate, up));
+    }
+};
+
+static std::vector<std::unique_ptr<test_case>> make_swiglu_mmq_cases(bool perf) {
+    std::vector<std::unique_ptr<test_case>> cases;
+    for (ggml_type type : {GGML_TYPE_Q4_K, GGML_TYPE_IQ4_XS, GGML_TYPE_Q6_K, GGML_TYPE_Q2_K, GGML_TYPE_Q5_K}) {
+        if (perf && (type == GGML_TYPE_Q2_K || type == GGML_TYPE_Q5_K)) {
+            continue;
+        }
+        if (perf) {
+            for (int64_t tokens : {256, 1024, 2048}) {
+                cases.emplace_back(new test_swiglu_mmq(type, 4096, tokens, 12288));
+                cases.emplace_back(new test_swiglu_mmq(type, 5120, tokens, 17408));
+            }
+        } else {
+            for (int64_t tokens : {1, 9, 32, 256, 1024}) {
+                cases.emplace_back(new test_swiglu_mmq(type, 128, tokens, 256));
+                cases.emplace_back(new test_swiglu_mmq(type, 129, tokens, 768));
+            }
+        }
+    }
+    return cases;
+}
 
 #define P 1.0f
 #define N -1.0f
@@ -8820,6 +8861,9 @@ static const ggml_type other_types[] = {
 
 // Test cases for evaluation: should try to cover edge cases while using small input sizes to keep the runtime low
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+    if (getenv("GGML_TEST_SWIGLU_MMQ")) {
+        return make_swiglu_mmq_cases(false);
+    }
     std::vector<std::unique_ptr<test_case>> test_cases;
     std::default_random_engine rng(0);
 
@@ -10848,6 +10892,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+    if (getenv("GGML_TEST_SWIGLU_MMQ")) {
+        return make_swiglu_mmq_cases(true);
+    }
     std::vector<std::unique_ptr<test_case>> test_cases;
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands

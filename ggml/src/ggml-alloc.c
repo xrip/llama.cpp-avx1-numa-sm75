@@ -397,10 +397,14 @@ static size_t ggml_dyn_tallocr_max_size(struct ggml_dyn_tallocr * alloc, int chu
 
 struct vbuffer {
     ggml_backend_buffer_t chunks[GGML_VBUFFER_MAX_CHUNKS];
+    int refs;
 };
 
 static void ggml_vbuffer_free(struct vbuffer * buf) {
     if (buf == NULL) {
+        return;
+    }
+    if (--buf->refs > 0) {
         return;
     }
     for (int i = 0; i < GGML_VBUFFER_MAX_CHUNKS; ++i) {
@@ -426,6 +430,7 @@ static struct vbuffer * ggml_vbuffer_alloc(ggml_backend_buffer_type_t buft, cons
     if (buf == NULL) {
         return NULL;
     }
+    buf->refs = 1;
 
     for (int n = 0; n < talloc->n_chunks; n++) {
         size_t chunk_size = talloc->chunks[n]->max_size;
@@ -533,6 +538,59 @@ ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs
 
 ggml_gallocr_t ggml_gallocr_new(ggml_backend_buffer_type_t buft) {
     return ggml_gallocr_new_n(&buft, 1);
+}
+
+bool ggml_gallocr_share_buffers(ggml_gallocr_t dst, ggml_gallocr_t src) {
+    if (!dst || !src || dst == src || dst->n_buffers != src->n_buffers) {
+        return false;
+    }
+    for (int i = 0; i < dst->n_buffers; ++i) {
+        if (dst->bufts[i] != src->bufts[i]) {
+            return false;
+        }
+        if (ggml_backend_buft_is_host(dst->bufts[i])) continue;
+        bool src_fits = true;
+        bool dst_fits = true;
+        for (int c = 0; c < GGML_VBUFFER_MAX_CHUNKS; ++c) {
+            const size_t a = src->buffers[i] ? ggml_vbuffer_chunk_size(src->buffers[i], c) : 0;
+            const size_t b = dst->buffers[i] ? ggml_vbuffer_chunk_size(dst->buffers[i], c) : 0;
+            src_fits &= a >= b;
+            dst_fits &= b >= a;
+        }
+        if (!src_fits && !dst_fits) return false;
+    }
+    bool shared = false;
+    for (int i = 0; i < dst->n_buffers; ++i) {
+        if (ggml_backend_buft_is_host(dst->bufts[i]) || (!src->buffers[i] && !dst->buffers[i])) {
+            continue;
+        }
+        bool duplicate = false;
+        for (int j = 0; j < i; ++j) {
+            if (dst->bufts[j] == dst->bufts[i]) {
+                dst->buffers[i] = dst->buffers[j];
+                src->buffers[i] = src->buffers[j];
+                duplicate = true;
+                break;
+            }
+        }
+        if (!duplicate) {
+            const size_t a = src->buffers[i] ? ggml_vbuffer_size(src->buffers[i]) : 0;
+            const size_t b = dst->buffers[i] ? ggml_vbuffer_size(dst->buffers[i]) : 0;
+            struct vbuffer * chosen = src->buffers[i] && (!dst->buffers[i] || a >= b) ? src->buffers[i] : dst->buffers[i];
+            if (dst->buffers[i] != chosen) {
+                ggml_vbuffer_free(dst->buffers[i]);
+                dst->buffers[i] = chosen;
+                ++chosen->refs;
+            }
+            if (src->buffers[i] != chosen) {
+                ggml_vbuffer_free(src->buffers[i]);
+                src->buffers[i] = chosen;
+                ++chosen->refs;
+            }
+        }
+        shared = true;
+    }
+    return shared;
 }
 
 void ggml_gallocr_free(ggml_gallocr_t galloc) {
