@@ -937,31 +937,20 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1(
     v[0] = q4[0];
     v[1] = q4[4];
 
-    uint16_t aux[2];
-    const int j = bq8_offset/2;
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_TURING
-    const uint32_t * scales = (const uint32_t *)bq4_K->scales;
-    const int shift = 16 * (j & 1);
-    const uint16_t scale0 = scales[0] >> shift;
-    const uint16_t scale1 = scales[1] >> shift;
-    const uint16_t scale2 = scales[2] >> shift;
-    if (j < 2) {
-        aux[0] = scale0 & 0x3f3f;
-        aux[1] = scale1 & 0x3f3f;
-    } else {
-        aux[0] = ((scale2 >> 0) & 0x0f0f) | ((scale0 & 0xc0c0) >> 2);
-        aux[1] = ((scale2 >> 4) & 0x0f0f) | ((scale1 & 0xc0c0) >> 2);
-    }
-#else
+    // branchless so nvcc can hoist this out of the ncols_dst loop
     const uint16_t * scales = (const uint16_t *)bq4_K->scales;
-    if (j < 2) {
-        aux[0] = scales[j+0] & 0x3f3f;
-        aux[1] = scales[j+2] & 0x3f3f;
-    } else {
-        aux[0] = ((scales[j+2] >> 0) & 0x0f0f) | ((scales[j-2] & 0xc0c0) >> 2);
-        aux[1] = ((scales[j+2] >> 4) & 0x0f0f) | ((scales[j-0] & 0xc0c0) >> 2);
-    }
-#endif
+    const int j  = bq8_offset/2;
+    const int jm = j & 1;
+
+    const uint32_t s0 = scales[jm + 0];
+    const uint32_t s2 = scales[jm + 2];
+    const uint32_t s4 = scales[jm + 4];
+
+    const uint32_t hi = (uint32_t) -(int32_t) (j >= 2);
+
+    uint16_t aux[2];
+    aux[0] = (uint16_t) (((s0 & 0x3f3f) & ~hi) | ((((s4 >> 0) & 0x0f0f) | ((s0 & 0xc0c0) >> 2)) & hi));
+    aux[1] = (uint16_t) (((s2 & 0x3f3f) & ~hi) | ((((s4 >> 4) & 0x0f0f) | ((s2 & 0xc0c0) >> 2)) & hi));
     const uint8_t * sc = (const uint8_t *)aux;
     const uint8_t * m  = sc + 2;
 
@@ -997,31 +986,20 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1(
     vh[0] = qh[0] >> bq8_offset;
     vh[1] = qh[4] >> bq8_offset;
 
-    uint16_t aux[2];
-    const int j = bq8_offset/2;
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_TURING
-    const uint32_t * scales = (const uint32_t *)bq5_K->scales;
-    const int shift = 16 * (j & 1);
-    const uint16_t scale0 = scales[0] >> shift;
-    const uint16_t scale1 = scales[1] >> shift;
-    const uint16_t scale2 = scales[2] >> shift;
-    if (j < 2) {
-        aux[0] = scale0 & 0x3f3f;
-        aux[1] = scale1 & 0x3f3f;
-    } else {
-        aux[0] = ((scale2 >> 0) & 0x0f0f) | ((scale0 & 0xc0c0) >> 2);
-        aux[1] = ((scale2 >> 4) & 0x0f0f) | ((scale1 & 0xc0c0) >> 2);
-    }
-#else
+    // same as q4_K
     const uint16_t * scales = (const uint16_t *)bq5_K->scales;
-    if (j < 2) {
-        aux[0] = scales[j+0] & 0x3f3f;
-        aux[1] = scales[j+2] & 0x3f3f;
-    } else {
-        aux[0] = ((scales[j+2] >> 0) & 0x0f0f) | ((scales[j-2] & 0xc0c0) >> 2);
-        aux[1] = ((scales[j+2] >> 4) & 0x0f0f) | ((scales[j-0] & 0xc0c0) >> 2);
-    }
-#endif
+    const int j  = bq8_offset/2;
+    const int jm = j & 1;
+
+    const uint32_t s0 = scales[jm + 0];
+    const uint32_t s2 = scales[jm + 2];
+    const uint32_t s4 = scales[jm + 4];
+
+    const uint32_t hi = (uint32_t) -(int32_t) (j >= 2);
+
+    uint16_t aux[2];
+    aux[0] = (uint16_t) (((s0 & 0x3f3f) & ~hi) | ((((s4 >> 0) & 0x0f0f) | ((s0 & 0xc0c0) >> 2)) & hi));
+    aux[1] = (uint16_t) (((s2 & 0x3f3f) & ~hi) | ((((s4 >> 4) & 0x0f0f) | ((s2 & 0xc0c0) >> 2)) & hi));
     const uint8_t * sc = (const uint8_t *)aux;
     const uint8_t * m  = sc + 2;
 
@@ -1066,6 +1044,48 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1(
 
 #define VDR_IQ2_XXS_Q8_1_MMVQ 2
 #define VDR_IQ2_XXS_Q8_1_MMQ  2
+
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_TURING
+// Identical maths to vec_dot_iq2_xxs_q8_1, but the codebook is read from shared
+// memory. Nsight on SM75 shows this kernel stalling almost entirely on
+// lg_throttle (19.81 per issue, 43x the next reason) -- the load/store unit's
+// instruction queue is full, while the MIO/shared pipe is idle (mio_throttle
+// 0.06). L1 hit rate is already 98%, so this is not about cache misses: a global
+// load occupies an LG issue slot whether or not it hits. Turning the four grid
+// lookups into LDS moves them onto the pipe that has capacity.
+static __device__ __forceinline__ float vec_dot_iq2_xxs_q8_1_sgrid(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs,
+    const uint64_t * __restrict__ s_grid) {
+
+    const block_iq2_xxs * bq2 = (const block_iq2_xxs *) vbq + kbx;
+
+    const int q2 = get_int_b2(bq2->qs, iqs);
+    const uint8_t * aux8 = (const uint8_t *) &q2;
+    const uint32_t aux32 = get_int_b2(bq2->qs, iqs + 1);
+
+    int sumi = 0;
+#pragma unroll
+    for (int k0 = 0; k0 < 8; k0 += 2) {
+        const uint2    grid_pos = ((const uint2 *) s_grid)[aux8[k0/2]];
+        const uint32_t signs    = unpack_ksigns(aux32 >> (7 * k0 / 2));
+
+        const int signs0 = __vcmpne4(signs & 0x08040201, 0);
+        const int grid0  = __vsub4(grid_pos.x ^ signs0, signs0);
+        const int u0     = get_int_b4(bq8_1[iqs/2].qs, k0 + 0);
+        sumi = ggml_cuda_dp4a(grid0, u0, sumi);
+
+        const int signs1 = __vcmpne4(signs & 0x80402010, 0);
+        const int grid1  = __vsub4(grid_pos.y ^ signs1, signs1);
+        const int u1     = get_int_b4(bq8_1[iqs/2].qs, k0 + 1);
+        sumi = ggml_cuda_dp4a(grid1, u1, sumi);
+    }
+
+    const int ls = aux32 >> 27 | 1; // (scale * 2 + 1)
+    sumi = sumi * ls / 8;           // (sumi * scale + sumi / 2) / 4
+    const float d = __half2float(bq2->d) * __low2float(bq8_1[iqs/2].ds);
+    return d * sumi;
+}
+#endif
 
 static __device__ __forceinline__ float vec_dot_iq2_xxs_q8_1(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
@@ -1419,3 +1439,241 @@ static __device__ __forceinline__ float vec_dot_iq4_xs_q8_1(
 
     return d * sumi;
 }
+
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_TURING
+// Shared-memory codebook variants. Identical maths; the grid is read from
+// LDS instead of LDG. These kernels are lg_throttle-bound on SM75 (19.81 per
+// issue vs mio_throttle 0.06), so moving codebook loads to the idle MIO pipe
+// is worth ~13% even though L1 hit rate is already 98%.
+static __device__ __forceinline__ float vec_dot_iq2_xs_q8_1_sgrid(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs, const uint64_t * __restrict__ s_grid) {
+
+    const block_iq2_xs * bq2 = (const block_iq2_xs *) vbq + kbx;
+
+    const int2 q2_packed = make_int2(get_int_b2(bq2->qs, iqs + 0), get_int_b2(bq2->qs, iqs + 1));
+    const uint16_t * q2 = (const uint16_t *) &q2_packed;
+    const int ls0 = bq2->scales[iqs/2] & 0x0F;
+    const int ls1 = bq2->scales[iqs/2] >> 4;
+
+    int sumi0 = 0;
+    int sumi1 = 0;
+#pragma unroll
+    for (int l0 = 0; l0 < 8; l0 += 2) {
+        const uint2 grid_pos = ((const uint2*)s_grid)[q2[l0/2] & 0x1FF];
+        const uint32_t signs = unpack_ksigns(q2[l0/2] >> 9);
+
+        const int signs0 = __vcmpne4(signs & 0x08040201, 0);
+        const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
+        const int u0 = get_int_b4(bq8_1[iqs/2].qs, l0 + 0);
+
+        const int signs1 = __vcmpne4(signs & 0x80402010, 0);
+        const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
+        const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);
+
+        if (l0 < 4) {
+            sumi0 = ggml_cuda_dp4a(grid_l, u0, sumi0);
+            sumi0 = ggml_cuda_dp4a(grid_h, u1, sumi0);
+        } else {
+            sumi1 = ggml_cuda_dp4a(grid_l, u0, sumi1);
+            sumi1 = ggml_cuda_dp4a(grid_h, u1, sumi1);
+        }
+    }
+    const int sumi = (sumi0*ls0 + sumi1*ls1 + (sumi0 + sumi1)/2)/4;
+    const float d = __half2float(bq2->d) * __low2float(bq8_1[iqs/2].ds);
+    return d * sumi;
+}
+
+static __device__ __forceinline__ float vec_dot_iq2_s_q8_1_sgrid(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs, const uint64_t * __restrict__ s_grid) {
+
+    const block_iq2_s * bq2 = (const block_iq2_s *) vbq + kbx;
+
+    const int       qs_packed = get_int_b2(bq2->qs, iqs/2);
+    const uint8_t * qs        = (const uint8_t *) &qs_packed;
+
+    const int qh = bq2->qh[iqs/2];
+
+    const int       signs_packed_32 = get_int_b2(bq2->qs, QK_K/32 + iqs/2);
+    const uint8_t * signs_packed_8  = (const uint8_t *) &signs_packed_32;
+
+    const int ls0 = bq2->scales[iqs/2] & 0x0F;
+    const int ls1 = bq2->scales[iqs/2] >> 4;
+
+    int sumi0 = 0;
+    int sumi1 = 0;
+#pragma unroll
+    for (int l0 = 0; l0 < 8; l0 += 2) {
+        const int * grid_pos = (const int *)(s_grid + (qs[l0/2] | ((qh << (8-l0)) & 0x300)));
+
+        const int signs0 = __vcmpne4(((signs_packed_8[l0/2] & 0x03) << 7) | ((signs_packed_8[l0/2] & 0x0C) << 21), 0x00000000);
+        const int signs1 = __vcmpne4(((signs_packed_8[l0/2] & 0x30) << 3) | ((signs_packed_8[l0/2] & 0xC0) << 17), 0x00000000);
+
+        const int grid_l = __vsub4(grid_pos[0] ^ signs0, signs0);
+        const int grid_h = __vsub4(grid_pos[1] ^ signs1, signs1);
+
+        const int u0 = get_int_b4(bq8_1[iqs/2].qs, l0 + 0);
+        const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);
+
+        if (l0 < 4) {
+            sumi0 = ggml_cuda_dp4a(grid_l, u0, sumi0);
+            sumi0 = ggml_cuda_dp4a(grid_h, u1, sumi0);
+        } else {
+            sumi1 = ggml_cuda_dp4a(grid_l, u0, sumi1);
+            sumi1 = ggml_cuda_dp4a(grid_h, u1, sumi1);
+        }
+    }
+    const int sumi = (sumi0*ls0 + sumi1*ls1 + (sumi0 + sumi1)/2)/4;
+
+    const float d = __half2float(bq2->d) * __low2float(bq8_1[iqs/2].ds);
+    return d * sumi;
+}
+
+static __device__ __forceinline__ float vec_dot_iq3_xxs_q8_1_sgrid(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs, const uint32_t * __restrict__ s_grid) {
+
+    const block_iq3_xxs * bq3 = (const block_iq3_xxs *) vbq + kbx;
+
+    const int2 q3_packed = make_int2(get_int_b2(bq3->qs, iqs), get_int_b2(bq3->qs, iqs+1));
+    const uint8_t * q3 = (const uint8_t *) &q3_packed;
+    const uint32_t aux32 = get_int_b2(bq3->qs, QK_K/16 + iqs/2);
+
+    int sumi = 0;
+#pragma unroll
+    for (int l0 = 0; l0 < 8; l0 += 2) {
+        const int2 grid_pos = make_int2(s_grid[q3[l0 + 0]], s_grid[q3[l0 + 1]]);
+        const uint32_t signs = unpack_ksigns(aux32 >> (7*l0/2));
+
+        const int signs0 = __vcmpne4(signs & 0x08040201, 0);
+        const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
+
+        const int u0 = get_int_b4(bq8_1[iqs/2].qs, l0 + 0);
+
+        const int signs1 = __vcmpne4(signs & 0x80402010, 0);
+        const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
+
+        const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);
+
+        sumi = ggml_cuda_dp4a(grid_l, u0, sumi);
+        sumi = ggml_cuda_dp4a(grid_h, u1, sumi);
+    }
+
+    const int ls = aux32 >> 28;
+    sumi = (ls*sumi + sumi/2)/2;
+    const float d = __half2float(bq3->d) * __low2float(bq8_1[iqs/2].ds);
+    return d * sumi;
+}
+
+static __device__ __forceinline__ float vec_dot_iq3_s_q8_1_sgrid(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs, const uint32_t * __restrict__ s_grid) {
+
+    const block_iq3_s * bq3 = (const block_iq3_s *) vbq + kbx;
+
+    const int2      qs_packed = make_int2(get_int_b2(bq3->qs, iqs + 0), get_int_b2(bq3->qs, iqs + 1));
+    const uint8_t * qs        = (const uint8_t *) &qs_packed;
+
+    const int qh = bq3->qh[iqs/2];
+
+    const int       signs_packed_32 = get_int_b2(bq3->signs, iqs/2);
+    const uint8_t * signs_packed_8  = (const uint8_t *) &signs_packed_32;
+
+    int sumi = 0;
+#pragma unroll
+    for (int l0 = 0; l0 < 8; l0 += 2) {
+        const int2 grid_pos = make_int2(
+            s_grid[qs[l0 + 0] | ((qh << (8 - l0)) & 0x100)],
+            s_grid[qs[l0 + 1] | ((qh << (7 - l0)) & 0x100)]);
+
+        const int signs0 = __vcmpne4(((signs_packed_8[l0/2] & 0x03) << 7) | ((signs_packed_8[l0/2] & 0x0C) << 21), 0x00000000);
+        const int signs1 = __vcmpne4(((signs_packed_8[l0/2] & 0x30) << 3) | ((signs_packed_8[l0/2] & 0xC0) << 17), 0x00000000);
+
+        const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
+        const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
+
+        const int u0 = get_int_b4(bq8_1[iqs/2].qs, l0 + 0);
+        const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);
+
+        sumi = ggml_cuda_dp4a(grid_l, u0, sumi);
+        sumi = ggml_cuda_dp4a(grid_h, u1, sumi);
+    }
+
+    sumi *= 1 + 2*((bq3->scales[iqs/4] >> ((iqs << 1) & 0x04)) & 0x0F);
+
+    const float d = __half2float(bq3->d) * __low2float(bq8_1[iqs/2].ds);
+    return d * sumi;
+}
+
+static __device__ __forceinline__ float vec_dot_iq1_s_q8_1_sgrid(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs, const uint32_t * __restrict__ s_grid) {
+    const block_iq1_s * bq1 = (const block_iq1_s *) vbq + kbx;
+
+    const int       qs_packed = get_int_b2(bq1->qs, iqs);
+    const uint8_t * qs        = (const uint8_t *) &qs_packed;
+
+    const int qh = bq1->qh[iqs];
+
+    int sumi = 0;
+#pragma unroll
+    for (int l0 = 0; l0 < 8; l0 += 2) {
+        const int grid = s_grid[qs[l0/2] | (((qh >> 3*(l0/2)) & 0x07) << 8)];
+
+        const int grid0 = (grid >> 0) & 0x0F0F0F0F;
+        const int grid1 = (grid >> 4) & 0x0F0F0F0F;
+
+        const int u0 = get_int_b4(bq8_1[iqs].qs, l0 + 0);
+        const int u1 = get_int_b4(bq8_1[iqs].qs, l0 + 1);
+
+        sumi = ggml_cuda_dp4a(grid0, u0, sumi);
+        sumi = ggml_cuda_dp4a(grid1, u1, sumi);
+    }
+
+    const float  d1q   = __half2float(bq1->d) * (((qh >> 11) & 0x0E) + 1);
+    const float  delta = -1.0f + IQ1S_DELTA - (qh & 0x8000) * (2.0f*IQ1S_DELTA/0x8000);
+    const float2 ds    = __half22float2(bq8_1[iqs].ds);
+    return d1q * (ds.x*sumi + ds.y*delta);
+}
+
+static __device__ __forceinline__ float vec_dot_iq1_m_q8_1_sgrid(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs, const uint32_t * __restrict__ s_grid) {
+
+    const block_iq1_m * bq1 = (const block_iq1_m *) vbq + kbx;
+
+    const int       qs_packed = get_int_b4(bq1->qs, iqs);
+    const uint8_t * qs        = (const uint8_t *) &qs_packed;
+
+    int   sumi[2] = {0};
+    float sumf[2] = {0.0f};
+#pragma unroll
+    for (int l0 = 0; l0 < 8; l0 += 2) {
+        const int qhl = bq1->qh[2*iqs + l0/4] >> (4 * ((l0/2) % 2));
+
+        const int grid = s_grid[qs[l0/2] | ((qhl & 0x07) << 8)];
+
+        const int grid0 = (grid >> 0) & 0x0F0F0F0F;
+        const int grid1 = (grid >> 4) & 0x0F0F0F0F;
+
+        const int u0 = get_int_b4(bq8_1[iqs].qs, l0 + 0);
+        const int u1 = get_int_b4(bq8_1[iqs].qs, l0 + 1);
+
+        sumi[l0/4] = ggml_cuda_dp4a(grid0, u0, sumi[l0/4]);
+        sumi[l0/4] = ggml_cuda_dp4a(grid1, u1, sumi[l0/4]);
+
+        const float delta = -1.0f + IQ1M_DELTA - (qhl & 0x08) * (2.0f*IQ1M_DELTA/0x08);
+        int sumy = 0;
+        sumy = ggml_cuda_dp4a(u0, 0x01010101, sumy);
+        sumy = ggml_cuda_dp4a(u1, 0x01010101, sumy);
+        sumf[l0/4] += delta*sumy;
+    }
+
+    const uint16_t * sc = (const uint16_t *) bq1->scales;
+
+    iq1m_scale_t scale;
+    scale.u16 = (sc[0] >> 12) | ((sc[1] >> 8) & 0x00F0) | ((sc[2] >> 4) & 0x0F00) | (sc[3] & 0xF000);
+    const float d = __half2float(scale.f16) * __low2float(bq8_1[iqs].ds);
+
+    const int tmp = sc[iqs/2] >> (6*(iqs%2));
+    const int sc0 = 2*((tmp >> 0) & 0x07) + 1;
+    const int sc1 = 2*((tmp >> 3) & 0x07) + 1;
+    return d * ((sumi[0] + sumf[0]) * sc0 + (sumi[1] + sumf[1]) * sc1);
+}
+#endif
+

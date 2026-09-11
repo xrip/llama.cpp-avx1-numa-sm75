@@ -212,6 +212,7 @@ static int ggml_cuda_parse_id(char devName[]) {
     }
     archNum += archMajor * 0x100;
     archNum += archMinor;
+
     return archNum;
 }
 #endif // defined(GGML_USE_HIP)
@@ -303,11 +304,7 @@ static ggml_cuda_device_info ggml_cuda_init() {
 
         info.default_tensor_split[id] = total_vram;
         total_vram += device_vram;
-#if defined(GGML_USE_HIP)
-        info.devices[id].integrated = prop.integrated;
-#else
         info.devices[id].integrated = false; // Temporarily disabled due to issues with corrupted output (e.g. #15034)
-#endif
         info.devices[id].nsm        = prop.multiProcessorCount;
         info.devices[id].smpb       = prop.sharedMemPerBlock;
         info.devices[id].warp_size  = prop.warpSize;
@@ -1864,8 +1861,7 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     if (cc <= GGML_CUDA_CC_PASCAL) {
         return false;
     }
-    //we only support fusion for ncols_dst = 1
-    if (tensor->op == GGML_OP_MUL_MAT && dst->ne[1] != 1) {
+    if (tensor->op == GGML_OP_MUL_MAT && !ggml_cuda_mmvq_fusion_supported(src0->type, cc, dst->ne[1])) {
         return false;
     }
 
@@ -1925,6 +1921,19 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
         return;
     }
+#ifndef GGML_CUDA_FORCE_MMQ
+    // Bound FP16 weight workspace and keep small batches on MMQ.
+    const bool sm75_ffn = (ne00 == 4096 && ne01 == 12288) || (ne00 == 12288 && ne01 == 4096)
+                      || (ne00 == 5120 && ne01 == 17408) || (ne00 == 17408 && ne01 == 5120);
+    if (cc == GGML_CUDA_CC_TURING && sm75_ffn && ne11 >= 1024 && ne11 <= 2048
+            && (src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_IQ4_XS)
+            && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1
+            && ggml_is_contiguous(src0) && ggml_is_contiguous(src1)
+            && !ggml_backend_buffer_is_host(src0->buffer)) {
+        ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
+        return;
+    }
+#endif
     if (ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0)) {
         ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
         return;

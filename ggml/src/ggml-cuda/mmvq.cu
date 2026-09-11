@@ -2,9 +2,39 @@
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
+#include "sm75-iq4-reuse.cuh"
 
 #include <cstdint>
 #include <type_traits>
+
+// only enabled on DGX Spark, where it is a gain on every type below. On the higher-bandwidth parts the kernel
+// has little exposed latency left to hide and the extra requests cost more than they save.
+// For perf data, see https://github.com/ggml-org/llama.cpp/pull/26705#issuecomment-5569335031
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_DGX_SPARK
+// returns true only for those quants that benefit from prefetch and false otherwise
+static constexpr __host__ __device__ bool mmvq_should_prefetch(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_MXFP4:
+        case GGML_TYPE_Q3_K:
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q6_K:
+        case GGML_TYPE_IQ1_M:
+        case GGML_TYPE_IQ4_NL:
+        case GGML_TYPE_IQ4_XS:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static __device__ __forceinline__ void mmvq_prefetch_l2(const void * p) {
+    asm volatile("prefetch.global.L2 [%0];" :: "l"(p));
+}
+#endif
 
 typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs);
 
@@ -299,9 +329,6 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
                 return ne11 <= 4;
             case GGML_TYPE_Q3_K:
                 return ne11 <= 6;
-            case GGML_TYPE_Q4_K:
-            case GGML_TYPE_Q5_K:
-                return ne11 <= 7;
             default:
                 return ne11 <= MMVQ_MAX_BATCH_SIZE;
         }
@@ -311,8 +338,9 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
             case GGML_TYPE_Q2_K:
             case GGML_TYPE_Q3_K:
             case GGML_TYPE_Q4_K:
-            case GGML_TYPE_Q5_K:
                 return ne11 <= 5;
+            case GGML_TYPE_Q5_K:
+                return ne11 <= 6;
             case GGML_TYPE_Q6_K:
                 return ne11 <= 7;
             default:
@@ -339,6 +367,33 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
                 return ne11 <= MMVQ_MAX_BATCH_SIZE;
         }
     }
+#ifndef GGML_CUDA_FORCE_CUBLAS
+    if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_TURING) {
+        // Tuned on a CMP 50HX. Turing had no entry here and fell through to
+        // ne11 <= 8, but MMQ overtakes MMVQ much earlier than that: by n=8 it
+        // is 1.7x-2.6x faster depending on the type. Only the types measured
+        // are listed; the rest keep the default.
+        //
+        // Guarded against GGML_CUDA_FORCE_CUBLAS: that option makes
+        // ggml_cuda_should_use_mmq() return false unconditionally, so lowering
+        // the threshold there would route small batches into cuBLAS, which has
+        // to dequantise the whole weight to F16 for a handful of columns,
+        // rather than into MMQ. The thresholds below were measured against MMQ
+        // and do not transfer to that configuration.
+        switch (type) {
+            case GGML_TYPE_Q2_K:
+            case GGML_TYPE_Q3_K:
+                return ne11 <= 2;
+            case GGML_TYPE_Q4_K:
+            case GGML_TYPE_Q5_K:
+            case GGML_TYPE_Q6_K:
+            case GGML_TYPE_IQ4_XS:
+                return ne11 <= 3;
+            default:
+                return ne11 <= MMVQ_MAX_BATCH_SIZE;
+        }
+    }
+#endif // GGML_CUDA_FORCE_CUBLAS
     if (GGML_CUDA_CC_IS_CDNA(cc)) {
         if (GGML_CUDA_CC_IS_CDNA1(cc)) {
             switch (type) {
@@ -491,6 +546,7 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
                 case GGML_TYPE_Q4_K:
                 case GGML_TYPE_Q5_K:
                 case GGML_TYPE_Q6_K:
+                case GGML_TYPE_IQ4_XS:
                     return 2;
                 default:
                     return 4;
@@ -670,11 +726,131 @@ static __global__ void mul_mat_vec_q(
     const block_q8_1 * y = ((const block_q8_1 *) vy) + sample_y*stride_sample_y + channel_y*stride_channel_y;
     const int kbx_offset = sample_x*stride_sample_x + channel_x*stride_channel_x + row0*stride_row_x;
 
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_TURING
+    // Stage the codebook in shared memory once per block for the grid-based
+    // quants. These kernels are not cache- or bandwidth-limited (L1 98%, DRAM
+    // 23%) but stall on lg_throttle 19.81/issue: the global load/store issue
+    // queue is saturated while the shared/MIO pipe is idle at 0.06. A load costs
+    // an LG issue slot even when it hits L1, so moving the codebook to LDS takes
+    // that traffic off the contended pipe. Measured -13.6% on IQ2_XXS at n=1.
+    // IQ1_S and IQ1_M share the 8 KiB iq1s_grid_gpu, which at 128 threads/block
+    // costs a block of occupancy per SM (8 -> 7). Measured, spreads <= 0.2%:
+    //   iq1_s  n=1 -5.2%   n=2 -11.1%   n=4 +7.7%   n=8 +2.2%
+    // so they win where the codebook traffic dominates and lose once the extra
+    // columns need the occupancy back. Restrict them to ncols_dst <= 2; token
+    // generation is ncols_dst == 1 and keeps the gain. IQ2_S is also 8 KiB but
+    // wins at every n (-9% to -16%), so size alone is not the deciding factor.
+    constexpr bool iq1_shared = (type == GGML_TYPE_IQ1_S || type == GGML_TYPE_IQ1_M) && ncols_dst <= 2;
+    constexpr int sgrid_u32 =
+        type == GGML_TYPE_IQ2_XXS ?  256*2 :
+        type == GGML_TYPE_IQ2_XS  ?  512*2 :
+        type == GGML_TYPE_IQ2_S   ? 1024*2 :
+        type == GGML_TYPE_IQ3_XXS ?  256   :
+        type == GGML_TYPE_IQ3_S   ?  512   :
+        iq1_shared                ? 2048   : 0;
+
+    __shared__ uint32_t s_grid[sgrid_u32 > 0 ? sgrid_u32 : 1];
+    if constexpr (sgrid_u32 > 0) {
+        const uint32_t * g_grid = nullptr;
+        if constexpr (type == GGML_TYPE_IQ2_XXS) { g_grid = (const uint32_t *) iq2xxs_grid;   }
+        else if constexpr (type == GGML_TYPE_IQ2_XS ) { g_grid = (const uint32_t *) iq2xs_grid;   }
+        else if constexpr (type == GGML_TYPE_IQ2_S  ) { g_grid = (const uint32_t *) iq2s_grid;    }
+        else if constexpr (type == GGML_TYPE_IQ3_XXS) { g_grid = (const uint32_t *) iq3xxs_grid;  }
+        else if constexpr (type == GGML_TYPE_IQ3_S  ) { g_grid = (const uint32_t *) iq3s_grid;    }
+        else if constexpr (type == GGML_TYPE_IQ3_S  ) { g_grid = (const uint32_t *) iq3s_grid;    }
+        else                                          { g_grid = (const uint32_t *) iq1s_grid_gpu; }
+        for (int i = tid; i < sgrid_u32; i += nwarps*warp_size) {
+            s_grid[i] = g_grid[i];
+        }
+        __syncthreads();
+    }
+#endif
+
     for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
         const int kby = kbx * (qk/QK8_1); // y block index that aligns with kbx
 
         // x block quant index when casting the quants to int
         const int kqs = vdr * (tid % (qi/vdr));
+
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_DGX_SPARK
+        // start the next iterations' weight loads early
+        if constexpr (mmvq_should_prefetch(type)) {
+            constexpr int pf_dist = 2; // loop iterations, not blocks
+            const int kbx_pf = kbx + pf_dist*blocks_per_iter;
+            if (kbx_pf < blocks_per_row_x) {
+#pragma unroll
+                for (int i = 0; i < rows_per_cuda_block; ++i) {
+                    const size_t off = (size_t)(kbx_offset + i*stride_row_x + kbx_pf) * ggml_cuda_type_traits<type>::bs;
+                    mmvq_prefetch_l2((const char *) vx + off);
+                    if constexpr (has_fusion) {
+                        if (use_gate) {
+                            mmvq_prefetch_l2((const char *) vgate + off);
+                        }
+                    }
+                }
+            }
+        }
+#endif
+
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_TURING
+        if constexpr (sgrid_u32 > 0) {
+            auto sdot = [&] (const void * vsrc, const block_q8_1 * by, int bx) -> float {
+                if constexpr (type == GGML_TYPE_IQ2_XXS) {
+                    return vec_dot_iq2_xxs_q8_1_sgrid(vsrc, by, bx, kqs, (const uint64_t *) s_grid);
+                } else if constexpr (type == GGML_TYPE_IQ2_XS) {
+                    return vec_dot_iq2_xs_q8_1_sgrid (vsrc, by, bx, kqs, (const uint64_t *) s_grid);
+                } else if constexpr (type == GGML_TYPE_IQ2_S) {
+                    return vec_dot_iq2_s_q8_1_sgrid  (vsrc, by, bx, kqs, (const uint64_t *) s_grid);
+                } else if constexpr (type == GGML_TYPE_IQ3_XXS) {
+                    return vec_dot_iq3_xxs_q8_1_sgrid(vsrc, by, bx, kqs, s_grid);
+                } else if constexpr (type == GGML_TYPE_IQ3_S) {
+                    return vec_dot_iq3_s_q8_1_sgrid  (vsrc, by, bx, kqs, s_grid);
+                } else if constexpr (type == GGML_TYPE_IQ1_S) {
+                    return vec_dot_iq1_s_q8_1_sgrid  (vsrc, by, bx, kqs, s_grid);
+                } else {
+                    return vec_dot_iq1_m_q8_1_sgrid  (vsrc, by, bx, kqs, s_grid);
+                }
+            };
+#pragma unroll
+            for (int j = 0; j < ncols_dst; ++j) {
+#pragma unroll
+                for (int i = 0; i < rows_per_cuda_block; ++i) {
+                    const int bx = kbx_offset + i*stride_row_x + kbx;
+                    tmp[j][i] += sdot(vx, &y[j*stride_col_y + kby], bx);
+                    if constexpr (has_fusion) {
+                        if (use_gate) {
+                            tmp_gate[j][i] += sdot(vgate, &y[j*stride_col_y + kby], bx);
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+#endif
+
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_TURING && GGML_SM75_IQ4_REUSE
+        if constexpr (type == GGML_TYPE_IQ4_XS && ncols_dst >= 2 && ncols_dst <= 4) {
+#pragma unroll
+            for (int i = 0; i < rows_per_cuda_block; ++i) {
+                const int bx = kbx_offset + i * stride_row_x + kbx;
+                const sm75_iq4_decoded w = sm75_iq4_decode(vx, bx, kqs);
+#pragma unroll
+                for (int j = 0; j < ncols_dst; ++j) {
+                    tmp[j][i] += sm75_iq4_dot(w, &y[j * stride_col_y + kby + kqs / 4]);
+                }
+                if constexpr (has_fusion) {
+                    if (use_gate) {
+                        const sm75_iq4_decoded gate = sm75_iq4_decode(vgate, bx, kqs);
+#pragma unroll
+                        for (int j = 0; j < ncols_dst; ++j) {
+                            tmp_gate[j][i] += sm75_iq4_dot(gate, &y[j * stride_col_y + kby + kqs / 4]);
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+#endif
 
 #pragma unroll
         for (int j = 0; j < ncols_dst; ++j) {
@@ -957,7 +1133,7 @@ static void mul_mat_vec_q_switch_fusion(
 
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
                             fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
-    if constexpr (c_ncols_dst == 1) {
+    if constexpr (ggml_cuda_mmvq_fusion_supported(type, GGML_CUDA_CC_TURING, c_ncols_dst)) {
         if (has_fusion) {
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
             ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, halve_iters>, launch_params,
@@ -968,7 +1144,7 @@ static void mul_mat_vec_q_switch_fusion(
         }
     }
 
-    GGML_ASSERT(!has_fusion && "fusion only supported for ncols_dst=1");
+    GGML_ASSERT(!has_fusion && "unsupported MMVQ fusion shape");
 
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
     ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, halve_iters>, launch_params,
@@ -1387,7 +1563,7 @@ void ggml_cuda_mul_mat_vec_q(
     if (fusion) {
         const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
         GGML_ASSERT( !ids || dst->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc));
-        GGML_ASSERT(  ids || dst->ne[1] == 1);
+        GGML_ASSERT(  ids || ggml_cuda_mmvq_fusion_supported(src0->type, cc, dst->ne[1]));
         // Scale fusion is only allowed for NVFP4 currently as the cost of checking this at run-time in the prologue is
         // non-negligible for some models such as gpt-oss-20b
         GGML_ASSERT((fusion->x_scale == nullptr && fusion->gate_scale == nullptr) || src0->type == GGML_TYPE_NVFP4);
