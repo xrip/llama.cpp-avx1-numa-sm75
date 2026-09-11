@@ -1782,6 +1782,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     ggml_tensor * ids_tensor = node->src[2];
                     ggml_backend_t ids_backend = split_backend;
 
+                    if (ggml_nelements(ids_tensor) == 0) {
+                        continue;
+                    }
+
                     // if the ids tensor is also an input of the split, it may not have been copied yet to the split backend
                     // in that case, we use the original ids tensor
                     for (int i = input_id + 1; i < split->n_inputs; i++) {
@@ -2014,6 +2018,22 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     free(sched->graph.nodes);
     free(sched->graph.leafs);
     free(sched);
+}
+
+bool ggml_backend_sched_share_compute_buffers(ggml_backend_sched_t dst, ggml_backend_sched_t src) {
+    if (!dst || !src || dst == src || dst->is_alloc || src->is_alloc || dst->n_copies != 1 || src->n_copies != 1 ||
+            dst->n_backends != src->n_backends) {
+        return false;
+    }
+    for (int i = 0; i < dst->n_backends; ++i) {
+        if (dst->bufts[i] != src->bufts[i] ||
+                ggml_backend_get_device(dst->backends[i]) != ggml_backend_get_device(src->backends[i])) {
+            return false;
+        }
+    }
+    ggml_backend_sched_synchronize(src);
+    ggml_backend_sched_synchronize(dst);
+    return ggml_gallocr_share_buffers(dst->galloc, src->galloc);
 }
 
 void ggml_backend_sched_reset(ggml_backend_sched_t sched) {

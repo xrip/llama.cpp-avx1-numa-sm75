@@ -561,10 +561,15 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     }
 
     const int64_t D = S_v * S_v * H_v;
-    const int64_t K = cparams.n_rs_seq + 1;
+    const bool txn = mctx_cur->txn_enabled();
+    const int64_t K = txn ? 1 : cparams.n_rs_seq + 1;
 
     // state s is 4D [S_v, S_v, H_v, n_seqs]; K snapshot slots are written into the output.
     ggml_tensor * gdn_out = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, K);
+    if (txn) {
+        gdn_out->src[6] = mctx_cur->get_txn_l(il);
+        gdn_out->src[7] = ggml_view_1d(ctx0, ssm_states_all, D, D * sizeof(float));
+    }
     if (n_seq_tokens > 1) {
         res->add_fused_node({LLM_FUSED_OP_GDN_CH, gdn_out, il});
     } else {

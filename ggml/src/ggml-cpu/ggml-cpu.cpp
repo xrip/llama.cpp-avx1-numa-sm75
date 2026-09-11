@@ -899,6 +899,9 @@ static int ggml_backend_cpu_device_get_n_threads_max(ggml_backend_dev_t dev) {
 }
 
 static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
+    if (op->op == GGML_OP_GATED_DELTA_NET && op->src[6] != nullptr) {
+        return false;
+    }
     const struct ggml_tensor * src0 = op->src[0];
     const struct ggml_tensor * src1 = op->src[1];
 
