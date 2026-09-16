@@ -5067,9 +5067,13 @@ static void init_mul_mat_id_ids(ggml_context * ctx, int n_mats) {
     }
 }
 
-static void init_mul_mat_id_tensors(ggml_context * ctx, int n_mats) {
+static void init_mul_mat_id_tensors(ggml_context * ctx, int n_mats, float amax = 1.0f) {
     for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
-        if (t->type != GGML_TYPE_I32) {
+        if (t->type == GGML_TYPE_I32) {
+            continue;
+        } else if (amax != 1.0f && t->type == GGML_TYPE_F32) {
+            init_tensor_uniform(t, -amax, amax);
+        } else {
             init_tensor_uniform(t);
         }
     }
@@ -5086,9 +5090,10 @@ struct test_mul_mat_id : public test_case {
     const int64_t m;
     const int64_t n;
     const int64_t k;
+    const float amax; // magnitude of src1
 
     std::string vars() override {
-        return VARS_TO_STR8(type_a, type_b, n_mats, n_used, b, m, n, k);
+        return VARS_TO_STR9(type_a, type_b, n_mats, n_used, b, m, n, k, amax);
     }
 
     double max_nmse_err() override {
@@ -5110,9 +5115,10 @@ struct test_mul_mat_id : public test_case {
 
     test_mul_mat_id(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
             int n_mats = 8, int n_used = 2, bool b = false,
-            int64_t m = 32, int64_t n = 32, int64_t k = 32)
+            int64_t m = 32, int64_t n = 32, int64_t k = 32,
+            float amax = 1.0f)
         : type_a(type_a), type_b(type_b), n_mats(n_mats), n_used(n_used), b(b),
-            m(m), n(n), k(k) {
+            m(m), n(n), k(k), amax(amax) {
             GGML_ASSERT(n_used <= n_mats);
         }
 
@@ -5138,7 +5144,7 @@ struct test_mul_mat_id : public test_case {
     }
 
     void initialize_tensors(ggml_context * ctx) override {
-        init_mul_mat_id_tensors(ctx, n_mats);
+        init_mul_mat_id_tensors(ctx, n_mats, amax);
     }
 
     void reinit_perf_iter(ggml_context * ctx) override {
@@ -7167,19 +7173,31 @@ struct test_sum_rows : public test_case {
 struct test_mean : public test_case {
     const ggml_type type;
     const std::array<int64_t, 4> ne;
+    const bool permute;
+    const bool slice;
 
     std::string vars() override {
-        return VARS_TO_STR2(type, ne);
+        return VARS_TO_STR4(type, ne, permute, slice);
     }
 
     test_mean(ggml_type type = GGML_TYPE_F32,
-            std::array<int64_t, 4> ne = {10, 5, 4, 3})
-        : type(type), ne(ne) {}
+            std::array<int64_t, 4> ne = {10, 5, 4, 3},
+            bool permute = false, bool slice = false)
+        : type(type), ne(ne), permute(permute), slice(slice) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne.data());
         ggml_set_param(a);
         ggml_set_name(a, "a");
+
+        if (slice) {
+            a = ggml_view_4d(ctx, a,
+                             ne[0], ne[1], ne[2] / 2, ne[3] - 1,
+                             a->nb[1], a->nb[2] * 2, a->nb[3], /*offset=*/a->nb[3]);
+        }
+        if (permute) {
+            a = ggml_permute(ctx, a, 0, 2, 3, 1);
+        }
 
         ggml_tensor * out = ggml_mean(ctx, a);
         ggml_set_name(out, "out");
@@ -10101,6 +10119,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 4, false, 16, 10, 256));
     }
 
+    // test src1 f16 overflow
+    // TODO: https://github.com/ggml-org/llama.cpp/pull/26223#issuecomment-5585815365
+    //for (int n : {16, 32, 64}) {
+    //    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 128, 4, false, 4096, n, 2048, 1e5f));
+    //    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8,   2, false, 512,  n, 256,  1e5f));
+    //}
+
     for (ggml_type type_a : base_types) {
         for (ggml_type type_b : {GGML_TYPE_F32 /*, GGML_TYPE_F16 */}) {
             for (int n_mats : {4, 8}) {
@@ -10514,6 +10539,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mean(GGML_TYPE_F32, { 32, 1, 1, 1 }));
     test_cases.emplace_back(new test_mean(GGML_TYPE_F32, { 32, 256, 1, 1 }));
     test_cases.emplace_back(new test_mean(GGML_TYPE_F32, { 32768, 1, 1, 1 }));
+    test_cases.emplace_back(new test_mean(GGML_TYPE_F32, { 11, 5, 6, 3 }, true, false));
+    test_cases.emplace_back(new test_mean(GGML_TYPE_F32, { 11, 5, 6, 3 }, false, true));
+    test_cases.emplace_back(new test_mean(GGML_TYPE_F32, { 11, 5, 6, 3 }, true, true));
     test_cases.emplace_back(new test_sum(GGML_TYPE_F32, { 33, 1, 1, 1 }));
     test_cases.emplace_back(new test_sum(GGML_TYPE_F32, { 33, 1024, 1, 1 }));
     test_cases.emplace_back(new test_sum(GGML_TYPE_F32, { 33, 256, 1, 1 }));
@@ -12032,8 +12060,7 @@ int main(int argc, char ** argv) {
         ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
         auto ggml_backend_set_n_threads_fn = (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
         if (ggml_backend_set_n_threads_fn) {
-            // TODO: better value for n_threads
-            ggml_backend_set_n_threads_fn(backend.get(), N_THREADS);
+            ggml_backend_set_n_threads_fn(backend.get(), std::max<int>(1, N_THREADS/2));
         }
 
         size_t free, total;  // NOLINT
