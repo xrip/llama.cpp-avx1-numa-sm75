@@ -511,6 +511,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("options:\n");
     printf("  -h, --help\n");
     printf("  --numa <distribute|isolate|numactl|split>   numa mode (default: disabled)\n");
+    printf("  --version                                   show version and build info\n");
     printf("  -r, --repetitions <n>                       number of times to repeat each test (default: %d)\n", cmd_params_defaults.reps);
     printf("  --prio <-1|0|1|2|3>                         process/thread priority (default: %d)\n", cmd_params_defaults.prio);
     printf("  --delay <0...N> (seconds)                   delay between each test (default: %d)\n", cmd_params_defaults.delay);
@@ -641,6 +642,9 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
         try {
             if (arg == "-h" || arg == "--help") {
                 print_usage(argc, argv);
+                exit(0);
+            } else if (arg == "--version") {
+                llama_print_build_info(llama_version());
                 exit(0);
             } else if (arg == "-m" || arg == "--model") {
                 if (++i >= argc) {

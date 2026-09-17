@@ -1440,6 +1440,7 @@ static void load_cl_kernels_argsort(ggml_backend_opencl_context *backend_ctx) {
 
 static bool use_adreno_bin_kernels(ggml_backend_opencl_context * backend_ctx) {
 #ifndef GGML_OPENCL_USE_ADRENO_BIN_KERNELS
+    GGML_UNUSED(backend_ctx);
     return false;
 #else
     if (backend_ctx->gpu_family != GPU_FAMILY::ADRENO) {
@@ -6309,6 +6310,8 @@ static void ggml_opencl_print_backend_info(ggml_backend_opencl_device_context * 
 
     auto * backend_ctx = dev_ctx->backend_ctx;
 
+    GGML_LOG_INFO("ggml_opencl: OpenCL device: %s\n",
+        backend_ctx->device_name.c_str());
     GGML_LOG_INFO("ggml_opencl: OpenCL driver: %s\n",
         backend_ctx->driver_version.c_str());
     GGML_LOG_INFO("ggml_opencl: vector subgroup broadcast support: %s\n",
@@ -6325,11 +6328,11 @@ static void ggml_opencl_print_backend_info(ggml_backend_opencl_device_context * 
         backend_ctx->global_mem_size/1024/1024);
     GGML_LOG_INFO("ggml_opencl: max mem alloc size: %zu MB\n",
         backend_ctx->max_alloc_size/1024/1024);
-    GGML_LOG_INFO("ggml_opencl: device max image buffer size (pixels): %lu\n",
+    GGML_LOG_INFO("ggml_opencl: device max image buffer size (pixels): %zu\n",
         backend_ctx->image_max_buffer_size);
-    GGML_LOG_INFO("ggml_opencl: device max image2d size: %lu x %lu\n",
+    GGML_LOG_INFO("ggml_opencl: device max image2d size: %zu x %zu\n",
         backend_ctx->image2d_max_width, backend_ctx->image2d_max_height);
-    GGML_LOG_INFO("ggml_opencl: device max workgroup size: %lu\n",
+    GGML_LOG_INFO("ggml_opencl: device max workgroup size: %zu\n",
         backend_ctx->max_workgroup_size);
     GGML_LOG_INFO("ggml_opencl: SVM coarse grain buffer support: %s\n",
         backend_ctx->svm_caps & CL_DEVICE_SVM_COARSE_GRAIN_BUFFER ? "true" : "false");
@@ -7627,7 +7630,7 @@ static void ggml_cl_moe_bias_glu_fused(ggml_backend_t backend, ggml_tensor * gat
     size_t global_work_size[] = { (size_t)glu->ne[1]*nth, (size_t)glu->ne[2], 1 };
     size_t local_work_size[]  = { (size_t)nth, 1, 1 };
 
-    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, (ggml_tensor *)glu);
+    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, glu);
 }
 
 // Fusion B: the MoE down-projection bias add feeding the combine.
@@ -7771,7 +7774,7 @@ static void ggml_cl_moe_bias_combine_fused(ggml_backend_t backend, const ggml_te
 
     size_t lws[2] = { 64, 1 };
     size_t gws[2] = { (size_t)(((n_embd4 + 63) / 64) * 64), (size_t)nt };
-    backend_ctx->enqueue_ndrange_kernel(kernel, 2, gws, lws, (ggml_tensor *)dst);
+    backend_ctx->enqueue_ndrange_kernel(kernel, 2, gws, lws, dst);
 }
 
 
@@ -8114,7 +8117,6 @@ static void ggml_cl_mul_mat_q4_k_glu_fused(ggml_backend_t backend, ggml_tensor *
     GGML_UNUSED(gate_tensor);
     GGML_UNUSED(up_tensor);
     GGML_UNUSED(glu_tensor);
-    GGML_ABORT("q4_K GLU fusion requires GGML_OPENCL_USE_ADRENO_KERNELS");
 #endif
 }
 
@@ -11336,7 +11338,6 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, 
 
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
         if (use_adreno_moe_kernels(backend_ctx, tensor)) {
-            cl_int err;
             cl_kernel kernel = backend_ctx->kernel_restore_block_q4_0_trans4_ns;
 
             cl_mem data_device = ggml_cl_create_temp_download_buffer(context, queue, ggml_nbytes(tensor), tensor->name);
@@ -11535,7 +11536,6 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, 
 
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
         if (use_adreno_moe_kernels(backend_ctx, tensor)) {
-            cl_int err;
             // TODO: use ggml_cl_buffer to manage this temporary buffer
             cl_mem data_device = ggml_cl_create_temp_download_buffer(context, queue, ggml_nbytes(tensor), tensor->name);
             GGML_ASSERT(data_device != NULL && "get_tensor: temp download buffer alloc failed");
@@ -11638,7 +11638,6 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, 
 
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
         if (use_adreno_moe_kernels(backend_ctx, tensor)) {
-            cl_int err;
             // TODO: use ggml_cl_buffer to manage this temporary buffer
             cl_mem data_device = ggml_cl_create_temp_download_buffer(context, queue, ggml_nbytes(tensor), tensor->name);
             GGML_ASSERT(data_device != NULL && "get_tensor: temp download buffer alloc failed");
@@ -24566,10 +24565,33 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     CL_CHECK(clReleaseMemObject(buf_src2));
 
                 } else { // for gemm
-                    kernel = backend_ctx->kernel_gemm_moe_q4_0_f32_ns;
-                    if (backend_ctx->kernel_gemm_moe_q4_0_f32_ns_bin) {
-                        kernel = backend_ctx->kernel_gemm_moe_q4_0_f32_ns_bin;
-                    }
+                    // dp4a (int8) prefill GEMM variant
+                    static const char * q4_0_moe_dp4a_env = getenv("GGML_OPENCL_Q4_0_MOE_DP4A");
+
+                    // It turns out that the prebuilt kernel only outperforms the dp4a variant (on X2-90)
+                    // at very large routing counts, so we gate its use accordingly using moe_bin_min,
+                    // which can be overridden via the GGML_OPENCL_MOE_BIN_MIN_ROUTINGS environment variable.
+                    // The routing count is ne20 * ne21 (n_expert_used * n_tokens).
+                    static const char * moe_bin_min_env = getenv("GGML_OPENCL_MOE_BIN_MIN_ROUTINGS");
+                    const int  moe_bin_min   = moe_bin_min_env ? atoi(moe_bin_min_env) : 4096;
+
+                    // whether bin kernels are available
+                    const bool bin_available = backend_ctx->kernel_gemm_moe_q4_0_f32_ns_bin != nullptr;
+                    const bool dp4a_bin_available = backend_ctx->kernel_gemm_moe_q4_0_q8_1_dp4a_bin != nullptr;
+
+                    bool use_moe_dp4a = q4_0_moe_dp4a_env
+                        ? (atoi(q4_0_moe_dp4a_env) != 0)
+                        : (backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E
+                           && (dp4a_bin_available || !bin_available
+                               || (int)(ne20 * ne21) < moe_bin_min));
+                    // dot prod has to be available
+                    use_moe_dp4a = backend_ctx->has_integer_dot && use_moe_dp4a;
+
+                    const bool use_bin_kernel = bin_available && !use_moe_dp4a;
+
+                    kernel = use_bin_kernel
+                        ? backend_ctx->kernel_gemm_moe_q4_0_f32_ns_bin
+                        : backend_ctx->kernel_gemm_moe_q4_0_f32_ns;
 
                     // Reorder router if called from test-backend-ops or when new router is generated.
                     // Otherwise reuse the reordered result from previous mul_mat_id call.
@@ -24581,18 +24603,6 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                     cl_mem sub_buf_src1_pre, sub_buf_dst, buf_dst_image;
                     cl_mem buf_src1_reordered = nullptr, image_src1_reordered = nullptr;
                     cl_mem buf_src2, buf_src2_emap;
-
-                    // dp4a (int8) prefill GEMM variant
-                    static const char * q4_0_moe_dp4a_env = getenv("GGML_OPENCL_Q4_0_MOE_DP4A");
-                    bool use_moe_dp4a = q4_0_moe_dp4a_env
-                        ? (atoi(q4_0_moe_dp4a_env) != 0)
-                        : (backend_ctx->adreno_gen == ADRENO_GPU_GEN::X2E);
-                    // dot prod has to be available
-                    use_moe_dp4a = backend_ctx->has_integer_dot && use_moe_dp4a;
-                    // bin kernel takes precedence
-                    if (backend_ctx->kernel_gemm_moe_q4_0_q8_1_dp4a_bin == nullptr) {
-                        use_moe_dp4a = use_moe_dp4a && backend_ctx->kernel_gemm_moe_q4_0_f32_ns_bin == nullptr;
-                    }
 
                     cl_buffer_region region;
                     region.origin = 0;
@@ -24632,7 +24642,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
                         cl_image_desc image_desc_buf_src1;
                         image_format_buf_src1 = {CL_RGBA, CL_FLOAT};
                         image_desc_buf_src1 = {CL_MEM_OBJECT_IMAGE1D_BUFFER, static_cast<size_t>(ne00 * max_post_router_tile * n_tile_size / 4), 0,0,0,0,0,0,0, {buf_src1_reordered}};
-                        if (backend_ctx->kernel_gemm_moe_q4_0_f32_ns_bin) {
+                        if (use_bin_kernel) {
                             // bin kernel uses slightly different image format
                             image_format_buf_src1 = {CL_R, CL_FLOAT};
                             image_desc_buf_src1.image_width = static_cast<size_t>(ne00 * max_post_router_tile * n_tile_size);
