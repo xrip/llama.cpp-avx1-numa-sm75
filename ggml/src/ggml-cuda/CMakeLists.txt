@@ -1,5 +1,7 @@
 cmake_minimum_required(VERSION 3.18)  # for CMAKE_CUDA_ARCHITECTURES
 
+option(GGML_CUDA_SM75_Q8_0_FAST_HALF "SM75: experimental packed Q8_0 to FP16 conversion in FlashAttention" OFF)
+
 find_package(CUDAToolkit)
 
 if (CUDAToolkit_FOUND)
@@ -119,6 +121,10 @@ if (CUDAToolkit_FOUND)
                              ${GGML_HEADERS_CUDA}
                              ${GGML_SOURCES_CUDA}
                             )
+
+    if (GGML_CUDA_SM75_Q8_0_FAST_HALF)
+        target_compile_definitions(ggml-cuda PRIVATE GGML_CUDA_SM75_Q8_0_FAST_HALF)
+    endif()
 
     if (GGML_CUDA_GRAPHS)
         add_compile_definitions(GGML_CUDA_USE_GRAPHS)

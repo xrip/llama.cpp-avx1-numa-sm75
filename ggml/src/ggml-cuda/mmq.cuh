@@ -1,6 +1,7 @@
 #pragma once
 
 #include "common.cuh"
+#include "sm75-tuning.cuh"
 
 #include <climits>
 #include <cstdint>
@@ -1480,25 +1481,42 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, 
     const int    cc    = ggml_cuda_info().devices[id].cc;
     const size_t smpbo = ggml_cuda_info().devices[id].smpbo;
 
-    int J_best        = 0;
-    int ntiles_J_best = INT_MAX;
+    const bool sm75_dense = cc == GGML_CUDA_CC_TURING && !fallback &&
+        (type == GGML_TYPE_Q4_K || type == GGML_TYPE_IQ4_XS) &&
+        !args.ids_dst && !args.expert_bounds && args.nchannels_x == 1 && args.nchannels_y == 1 &&
+        args.nsamples_x == 1 && args.nsamples_y == 1 && args.ncols_y >= 512 && args.ncols_y % 128 == 0;
+    const auto * tuning = sm75_dense ? &ggml_cuda_sm75::get_options() : nullptr;
+    const int J_limit = tuning ? ggml_cuda_sm75::mmq_j_limit(*tuning, true, args.ncols_y) : 128;
 
-    for (int J = 8; J <= 128 && ntiles_J_best > 1; J += 8) {
-        const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J, fallback, cc);
-        if (config.type == GGML_TYPE_COUNT) {
-            continue;
+    const auto select_J = [&](const int limit) {
+        int best = 0;
+        int ntiles_best = INT_MAX;
+        for (int J = 8; J <= limit && ntiles_best > 1; J += 8) {
+            const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J, fallback, cc);
+            if (config.type == GGML_TYPE_COUNT || mmq_get_nbytes_shared(config, cc) > smpbo) {
+                continue;
+            }
+            const int ntiles_x = (args.ncols_opt + config.J - 1) / config.J;
+            if (ntiles_x < ntiles_best) {
+                best = J;
+                ntiles_best = ntiles_x;
+            }
         }
+        return best;
+    };
 
-        if (mmq_get_nbytes_shared(config, cc) > smpbo) {
-            continue;
-        }
-
-        const int ntiles_x = (args.ncols_opt + config.J - 1) / config.J;
-
-        if (ntiles_x < ntiles_J_best) {
-            J_best = J;
-            ntiles_J_best = ntiles_x;
-        }
+    int J_best = select_J(J_limit);
+    if (J_best == 0 && J_limit < 128) {
+        // A cap is a tuning hint, not permission to launch an invalid kernel.
+        J_best = select_J(128);
+    }
+    // Keep ggml_cuda_mmq_get_J_max and all padding allocations unchanged: a
+    // narrower launch must not shrink buffers needed by another dispatch path.
+    if (tuning && tuning->trace && J_best != 0) {
+        GGML_LOG_INFO("SM75 MMQ: device=%d type=%s M=%lld K=%lld N=%lld J=%d cap=%d shared=%zu\n",
+                id, ggml_type_name(type), (long long) args.nrows_x, (long long) args.ncols_x,
+                (long long) args.ncols_y, J_best, J_limit,
+                mmq_get_nbytes_shared(ggml_cuda_mmq_get_config(type, J_best, fallback, cc), cc));
     }
 
     switch (J_best) {

@@ -3,6 +3,9 @@
 #include "common.cuh"
 #include "convert.cuh"
 #include "vecdotq.cuh"
+#ifdef GGML_CUDA_SM75_Q8_0_FAST_HALF
+#include "sm75-q8.cuh"
+#endif
 
 #include <cstdint>
 
@@ -601,7 +604,11 @@ static __device__ __forceinline__ void dequantize_V_q8_0(const void * __restrict
 
 #pragma unroll
         for (int l0 = 0; l0 < ne; l0 += 2) {
+#if defined(GGML_CUDA_SM75_Q8_0_FAST_HALF) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 750 && !defined(GGML_USE_HIP)
+            ((half2 *) dst)[l0/2] = d * ggml_cuda_sm75_q8_pair_to_half2(qs[l0 + 0], qs[l0 + 1]);
+#else
             ((half2 *) dst)[l0/2] = d * make_half2(qs[l0 + 0], qs[l0 + 1]);
+#endif
         }
     } else
 #endif // FP16_AVAILABLE

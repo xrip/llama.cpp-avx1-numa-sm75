@@ -31,6 +31,7 @@
 #include "ggml-cuda/im2col.cuh"
 #include "ggml-cuda/mmf.cuh"
 #include "ggml-cuda/mmq.cuh"
+#include "ggml-cuda/sm75-tuning.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/moe-weighted-reduction.cuh"
@@ -1931,16 +1932,25 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         return;
     }
 #ifndef GGML_CUDA_FORCE_MMQ
-    // Bound FP16 weight workspace and keep small batches on MMQ.
-    const bool sm75_ffn = (ne00 == 4096 && ne01 == 12288) || (ne00 == 12288 && ne01 == 4096)
-                      || (ne00 == 5120 && ne01 == 17408) || (ne00 == 17408 && ne01 == 5120);
-    if (cc == GGML_CUDA_CC_TURING && sm75_ffn && ne11 >= 1024 && ne11 <= 2048
-            && (src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_IQ4_XS)
+    // Preserve the existing FFN override in auto mode. Experimental modes are
+    // restricted to dense prefill; MMVQ/decode and MUL_MAT_ID are untouched.
+    const bool sm75_legacy_type = src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_IQ4_XS;
+    const bool sm75_test_type = sm75_legacy_type || src0->type == GGML_TYPE_Q5_K || src0->type == GGML_TYPE_Q6_K;
+    if (cc == GGML_CUDA_CC_TURING && sm75_test_type && ne11 >= 512
             && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1
             && ggml_is_contiguous(src0) && ggml_is_contiguous(src1)
             && !ggml_backend_buffer_is_host(src0->buffer)) {
-        ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
-        return;
+        const auto & tuning = ggml_cuda_sm75::get_options();
+        const bool use_cublas = ggml_cuda_sm75::use_cublas(tuning, sm75_legacy_type, sm75_test_type, ne00, ne01, ne11);
+        if (tuning.trace) {
+            GGML_LOG_INFO("SM75 prefill: device=%d type=%s M=%lld K=%lld N=%lld mode=%s override=%s\n",
+                    ctx.device, ggml_type_name(src0->type), (long long) ne01, (long long) ne00, (long long) ne11,
+                    ggml_cuda_sm75::mode_name(tuning.mode), use_cublas ? "cublas" : "none");
+        }
+        if (use_cublas) {
+            ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
+            return;
+        }
     }
 #endif
     if (ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0)) {
