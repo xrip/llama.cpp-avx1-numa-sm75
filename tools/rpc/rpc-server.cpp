@@ -255,6 +255,7 @@ static bool rpc_server_params_parse(int argc, char ** argv, rpc_server_params & 
     return true;
 }
 
+#if defined(GGML_CPU_NUMA_SPLIT_MAX_DEVICES)
 static int get_device_numa_node(ggml_backend_dev_t dev) {
     ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
     if (reg == nullptr) {
@@ -289,6 +290,7 @@ static enum ggml_numa_split_status init_numa_split() {
     }
     return status;
 }
+#endif
 
 static std::vector<ggml_backend_dev_t> get_devices(const rpc_server_params & params) {
     std::vector<ggml_backend_dev_t> devices;
@@ -322,6 +324,7 @@ static std::vector<ggml_backend_dev_t> get_devices(const rpc_server_params & par
         }
     }
 
+#if defined(GGML_CPU_NUMA_SPLIT_MAX_DEVICES)
     // With --numa split, make each CPU node available when devices were not selected explicitly.
     if (params.devices.empty() && params.numa_split) {
         for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
@@ -331,6 +334,7 @@ static std::vector<ggml_backend_dev_t> get_devices(const rpc_server_params & par
             }
         }
     }
+#endif
 
     // If there are no accelerators, fallback to CPU device
     if (devices.empty()) {
@@ -355,10 +359,15 @@ int main(int argc, char * argv[]) {
     }
 
     if (params.numa_split) {
+#if defined(GGML_CPU_NUMA_SPLIT_MAX_DEVICES)
         const enum ggml_numa_split_status status = init_numa_split();
         if (status == GGML_NUMA_SPLIT_STATUS_FAILED) {
             return 1;
         }
+#else
+        fprintf(stderr, "error: --numa split is not supported by this CPU backend\n");
+        return 1;
+#endif
     }
 
     if (params.host != "127.0.0.1") {
