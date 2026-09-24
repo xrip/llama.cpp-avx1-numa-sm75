@@ -17,6 +17,22 @@
 
 </div>
 
+## SM75 prefill test
+
+On an NVIDIA CMP 50HX with the Qwen3.8-27B IQ2_XXS GGUF, `build-best.sh` (`GGML_CUDA_FORCE_CUBLAS=ON`, `GGML_CUDA_SM75_Q8_0_FAST_HALF=ON`) measured 761.12 tokens/s for `pp1024`, versus 618.29 tokens/s with forced MMQ (+23%). Both builds used `GGML_CUDA_SM75_Q8_0_FAST_HALF=ON`, 99 GPU layers, FlashAttention, a Q8_0 V cache, and batch and ubatch sizes of 1024. `tg128` was 23.21 tokens/s with cuBLAS and 23.39 with MMQ, so the gain was in prefill. Results may differ on other GPUs or models.
+
+This result is for Turing (SM75); it is not a Blackwell result. The SM75 dispatch and Q8 conversion paths do not run on Blackwell.
+
+Build and measure:
+
+```sh
+./build-best.sh
+./build-best/bin/llama-bench \
+    -m /path/to/Qwen3.8-27B-UD-IQ2_XXS.gguf \
+    -p 1024 -n 0 -b 1024 -ub 1024 -ngl 99 \
+    -fa on -ctv q8_0 -r 5
+```
+
 ## Quick start
 
 A few options to get `llama.cpp` installed on your machine:

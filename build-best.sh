@@ -3,8 +3,8 @@ set -euo pipefail
 
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 
-# Keep the existing MoE build's forced-cuBLAS setting.
-cmake -S "$root" -B "$root/build-cublas" \
+# Build the SM75 cuBLAS path with the Q8_0 fast-half experiment enabled.
+cmake -S "$root" -B "$root/build-best" \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_C_COMPILER=gcc-14 -DCMAKE_CXX_COMPILER=g++-14 \
     -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc \
@@ -12,6 +12,7 @@ cmake -S "$root" -B "$root/build-cublas" \
     -DGGML_NATIVE=ON -DGGML_OPENMP=ON \
     -DGGML_CUDA=ON -DGGML_VULKAN=OFF -DGGML_BLAS=OFF \
     -DGGML_CUDA_FORCE_MMQ=OFF -DGGML_CUDA_FORCE_CUBLAS=ON \
+    -DGGML_CUDA_SM75_Q8_0_FAST_HALF=ON \
     -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_TOOLS=ON
-cmake --build "$root/build-cublas" --parallel "${CMAKE_BUILD_PARALLEL_LEVEL:-12}" \
+cmake --build "$root/build-best" --parallel "${CMAKE_BUILD_PARALLEL_LEVEL:-12}" \
     --target llama-server llama-cli llama-bench test-backend-ops
