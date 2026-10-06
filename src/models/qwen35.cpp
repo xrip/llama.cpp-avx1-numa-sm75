@@ -401,7 +401,7 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     ggml_tensor * state;
     if (mctx_cur->txn_enabled()) {
         GGML_ASSERT(n_seqs == 1 && mctx_cur->get_size() == 1);
-        state = build_rs(ssm_states_all, inp->txn_copy, inp->s_copy_extra, hparams.n_embd_s(), n_seqs,
+        state = build_rs(ssm_states_all, inp->s_copy_tail, inp->txn_copy, hparams.n_embd_s(), n_seqs,
             mctx_cur->get_n_rs(), mctx_cur->get_head(), mctx_cur->get_size(), mctx_cur->get_rs_z(), ggml_get_rows);
     } else {
         state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);

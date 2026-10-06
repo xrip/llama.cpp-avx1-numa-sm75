@@ -1189,7 +1189,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         auto & ctx_dft = params.ctx_dft;
 
         const int64_t n_vocab  = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx_dft)));
-        const int32_t n_tokens = batch.n_tokens;
+        const int32_t n_tokens = batch.size();
         const int32_t top_k    = selector_top_k;
         const int32_t rank     = selector_rank;
 
@@ -1434,7 +1434,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     // the predecessor candidate id: the anchor for block position 1, else the
                     // previously chosen candidate
                     const int32_t pred_id = i == 1
-                        ? batch.token[beg]
+                        ? batch.tokens[beg].id
                         : cand[(size_t) (pos - 1) * selector_top_k + predecessor];
 
                     std::vector<float> scores(selector_top_k);
