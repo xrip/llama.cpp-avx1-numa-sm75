@@ -4882,16 +4882,21 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 
             for (int32_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
                 for (int32_t id = 0; id < n_ids; ++id) {
-                    int32_t i02;
-                    memcpy(
-                            &i02,
-                            (const char *) ids->data + iid1 * ids->nb[1] + id * ids->nb[0],
-                            sizeof(i02));
-                    GGML_ASSERT(i02 >= 0 && i02 < n_as);
+                    const int32_t i02 =
+                        *(const int32_t *) ((const char *) ids->data + iid1 * ids->nb[1] + id * ids->nb[0]);
+
+                    GGML_ASSERT(i02 == -1 || (i02 >= 0 && i02 < n_as));
+
+                    if (i02 == -1) {
+                        memset((char *) dst->data + id*nb1 + iid1*nb2, 0, ne0*sizeof(float));
+                        continue;
+                    }
+
                     // Top-k routing should not select one expert twice for a token.
                     // Guard the fixed per-expert mapping capacity instead of corrupting
                     // the following expert's row list if malformed IDs are supplied.
                     GGML_ASSERT(matrix_row_counts[i02] < ne12);
+
                     MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = { id, iid1 };
                     matrix_row_counts[i02] += 1;
                 }

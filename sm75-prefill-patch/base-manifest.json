@@ -1,0 +1,11 @@
+{
+  "repository": "xrip/llama.cpp-avx1-numa-sm75",
+  "branch": "master",
+  "base_commit": "af084752abb72652d51785602ef9536f631fec9d",
+  "original_blob_sha1": {
+    "ggml/src/ggml-cuda/CMakeLists.txt": "2254090cbab05c04d8a70e784484d7f5151a1c22",
+    "ggml/src/ggml-cuda/ggml-cuda.cu": "33ea141dcefdedde21cf33d6e97793182058b184",
+    "ggml/src/ggml-cuda/mmq.cuh": "d9b0b72c72afcea5a211348f190a26ae8009b4ef",
+    "ggml/src/ggml-cuda/fattn-common.cuh": "6d1ce52dbc774d8ad274a931e55f79e3a436ab99"
+  }
+}

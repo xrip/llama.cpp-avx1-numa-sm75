@@ -1,0 +1,83 @@
+{
+  "gcc": {
+    "compile_command": "g++ -std=c++17 -O2 -Wall -Wextra -Werror -pedantic -I ${GGML_SOURCE_DIR}/ggml/src/ggml-cuda ${PACKAGE_DIR}/validation/test-sm75-host.cpp -o ${BUILD_DIR}/gcc",
+    "returncode": 0,
+    "stdout": "PASS: 134968 checks; includes all 65536 ordered INT8 pairs",
+    "stderr": ""
+  },
+  "clang": {
+    "compile_command": "clang++ -std=c++17 -O2 -Wall -Wextra -Werror -pedantic -I ${GGML_SOURCE_DIR}/ggml/src/ggml-cuda ${PACKAGE_DIR}/validation/test-sm75-host.cpp -o ${BUILD_DIR}/clang",
+    "returncode": 0,
+    "stdout": "PASS: 134968 checks; includes all 65536 ordered INT8 pairs",
+    "stderr": ""
+  },
+  "gcc-sanitized": {
+    "compile_command": "g++ -std=c++17 -O2 -Wall -Wextra -Werror -pedantic -fsanitize=address,undefined -fno-omit-frame-pointer -I ${GGML_SOURCE_DIR}/ggml/src/ggml-cuda ${PACKAGE_DIR}/validation/test-sm75-host.cpp -o ${BUILD_DIR}/gcc-sanitized",
+    "returncode": 0,
+    "stdout": "PASS: 134968 checks; includes all 65536 ordered INT8 pairs",
+    "stderr": ""
+  },
+  "environment_cases": {
+    "passed": 18
+  },
+  "binary16_host_reference": {
+    "codes": 256,
+    "finite_half_scales": 63488,
+    "products_checked": 16252928,
+    "passed": true,
+    "note": "CPU IEEE binary16 reference, not a CUDA execution or timing test"
+  },
+  "not_run": [
+    "full repository checkout/build",
+    "nvcc compilation",
+    "SM75 GPU execution",
+    "backend numerical/perplexity regressions",
+    "CUDA Graph and two-GPU execution",
+    "performance/VRAM benchmarks"
+  ],
+  "patch": {
+    "base_commit": "af084752abb72652d51785602ef9536f631fec9d",
+    "stats": [
+      {
+        "file": "docs/sm75-ninfer-prefill-experiments.md",
+        "added": 118,
+        "deleted": 0
+      },
+      {
+        "file": "ggml/src/ggml-cuda/CMakeLists.txt",
+        "added": 6,
+        "deleted": 0
+      },
+      {
+        "file": "ggml/src/ggml-cuda/fattn-common.cuh",
+        "added": 7,
+        "deleted": 0
+      },
+      {
+        "file": "ggml/src/ggml-cuda/ggml-cuda.cu",
+        "added": 17,
+        "deleted": 7
+      },
+      {
+        "file": "ggml/src/ggml-cuda/mmq.cuh",
+        "added": 34,
+        "deleted": 16
+      },
+      {
+        "file": "ggml/src/ggml-cuda/sm75-q8.cuh",
+        "added": 30,
+        "deleted": 0
+      },
+      {
+        "file": "ggml/src/ggml-cuda/sm75-tuning.cuh",
+        "added": 144,
+        "deleted": 0
+      }
+    ],
+    "verified_old_lines": 104,
+    "git_apply_context_fixture": "PASS: --check, apply, reverse --check, reverse; bytes compared",
+    "git_apply_full_checkout": "NOT RUN: network clone/download was unavailable; GitHub connector supplied exact source ranges",
+    "placeholder_or_unretrieved_lines_in_patch": false,
+    "new_paths_absent_at_base": "Confirmed via GitHub: both new headers and the new document returned 404 at the pinned commit"
+  }
+}

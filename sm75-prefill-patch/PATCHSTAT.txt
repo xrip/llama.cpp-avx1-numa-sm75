@@ -1,0 +1,7 @@
+118	0	docs/sm75-ninfer-prefill-experiments.md
+6	0	ggml/src/ggml-cuda/CMakeLists.txt
+7	0	ggml/src/ggml-cuda/fattn-common.cuh
+17	7	ggml/src/ggml-cuda/ggml-cuda.cu
+34	16	ggml/src/ggml-cuda/mmq.cuh
+30	0	ggml/src/ggml-cuda/sm75-q8.cuh
+144	0	ggml/src/ggml-cuda/sm75-tuning.cuh
