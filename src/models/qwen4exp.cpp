@@ -353,7 +353,8 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
 
         // the converter pads the table; a model synthesised from metadata has no tensor to ask
         const std::string ple_name = tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight").str();
-        if (const auto * ple_w = ml.get_weight(ple_name.c_str())) {
+        const auto * ple_w = ml.get_weight(ple_name.c_str());
+        if (ple_w) {
             if (ple_w->tensor->ne[1] < ple_rows) {
                 throw std::runtime_error(format("%s has %" PRId64 " rows, too few for the PLE head ranges (%" PRId64 ")",
                                                 ple_name.c_str(), ple_w->tensor->ne[1], ple_rows));
@@ -365,18 +366,18 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
                                            { hparams.ple_head_dim, ple_rows }, TENSOR_READ_LAZY);
         // --lazy-mode on-direct: read the gathered rows with explicit pread()s
         // instead of faulting them in through the mmap
-        if (ml.lazy.mode == LLAMA_LAZY_MODE_DIRECT) {
+        if (ml.lazy.mode == LLAMA_LAZY_MODE_DIRECT && ple_w) {
 #ifndef _WIN32
             // an independent buffered descriptor: dup() would share the loader's
             // open file description, whose readahead advice and O_DIRECT flag
             // (init_mappings applies POSIX_FADV_SEQUENTIAL, --load-mode dio)
             // would fight the small scattered row reads
-            const int fd = ::open(ml.files[ple_w.idx]->name().c_str(), O_RDONLY | O_CLOEXEC);
+            const int fd = ::open(ml.files[ple_w->idx]->name().c_str(), O_RDONLY | O_CLOEXEC);
             if (fd < 0) {
                 // e.g. a FILE*-backed model has no reopenable path; the tensor is
                 // still lazy, so keep serving it through the mmap reads
                 LLAMA_LOG_WARN("%s: could not open %s for direct reads (%s), using lazy mmap reads\n",
-                        __func__, ml.files[ple_w.idx]->name().c_str(), strerror(errno));
+                        __func__, ml.files[ple_w->idx]->name().c_str(), strerror(errno));
             } else {
 #ifdef __linux__
                 // rows are tiny and scattered, so sequential readahead would be
@@ -388,12 +389,12 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
                 // well on NVMe and stays sane on smaller machines
                 const int n_threads = 2 * (int) std::max(1u, std::thread::hardware_concurrency());
 
-                ple_reader = std::make_unique<ple_direct_reader>(fd, ple_w.offs,
+                ple_reader = std::make_unique<ple_direct_reader>(fd, ple_w->offs,
                         ggml_row_size(per_layer_tok_embd->type, per_layer_tok_embd->ne[0]), ple_rows, n_threads,
                         per_layer_tok_embd->type, hparams.ple_head_dim);
 
                 LLAMA_LOG_INFO("%s: PLE direct read enabled: %" PRId64 " rows of %zu bytes at file offset %zu, %d threads\n",
-                        __func__, ple_rows, ple_reader->row_size, ple_w.offs, n_threads);
+                        __func__, ple_rows, ple_reader->row_size, ple_w->offs, n_threads);
             }
 #else
             LLAMA_LOG_WARN("%s: --lazy-mode on-direct is not supported on this platform, using lazy mmap reads\n", __func__);
